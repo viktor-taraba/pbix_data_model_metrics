@@ -18,6 +18,26 @@ supported pure-Python / cross-platform path to it — only ADOMD.NET
 cross-platform; that's not solvable without a Windows host and a
 running Power BI Desktop process.
 
+## Environment / dependency management
+
+This project uses **uv**, not raw `pip`. Source of truth is
+`pyproject.toml` + `uv.lock`; there is no `requirements.txt`.
+
+- Install/sync deps: `uv sync` (creates/updates `.venv` from `uv.lock`).
+- Run anything in the project's env: `uv run python analyze_pbix.py ...`
+  — don't assume a bare `python`/`pip` on PATH is the right interpreter.
+- Adding/bumping a dependency: edit `dependencies` in `pyproject.toml`,
+  then `uv lock` to regenerate `uv.lock`, then `uv sync`. Don't hand-edit
+  `uv.lock` or reach for `pip install X` — that installs outside the
+  locked environment and will drift from what `uv.lock` says is pinned.
+- `requires-python = ">=3.13"` (see also `.python-version` = `3.13`).
+- Sandboxes without network access to `pypi.org`/`files.pythonhosted.org`
+  (like this one) can't run `uv sync`/`uv lock` for real — when testing
+  changes here, install ad hoc with `pip install <pkg> --break-system-packages`
+  instead, or stub out modules (e.g. a fake `pbi_connection.PbiConnection`)
+  the way the hierarchy-size fix in this session was verified, since
+  there's no live Windows/Power BI Desktop/ADOMD.NET available either.
+
 ## File map
 
 | File | Responsibility |
@@ -39,15 +59,35 @@ running Power BI Desktop process.
   `DISCOVER_STORAGE_TABLE_COLUMNS` — this rowset conveniently already
   has human-readable `DIMENSION_NAME`/`ATTRIBUTE_NAME`, so it's also
   used as the master table→column name/datatype/encoding lookup.
+- **`base` (the per-column list) is restricted to real tables only**
+  (`TABLE_ID` filtered to `real_table_ids`, same test as `real_tables`).
+  This was a real, previously-shipped bug: `DISCOVER_STORAGE_TABLE_COLUMNS`
+  also lists the "H$" pseudo-table's *own* columns as their own rows
+  (same `DIMENSION_NAME`/`ATTRIBUTE_NAME` as the real column, but blank
+  `DATATYPE`/`COLUMN_ENCODING` and zero `DICTIONARY_SIZE`). Without this
+  filter, every real column is silently duplicated by a "ghost" row that
+  shows up as `DataType = N/A`, `Encoding = UNKNOWN` — don't remove this
+  filter.
 - **Hierarchy Size**: `SUM(USED_SIZE)` from segments whose `TABLE_ID`
-  starts with `H$`, joined back to the real column by matching
-  `(DIMENSION_NAME, COLUMN_ID)` together — **not** `COLUMN_ID` alone.
-  `COLUMN_ID` is only unique *within* a table, not across the model, so
-  a global join on `COLUMN_ID` silently merges unrelated columns in
-  different tables that happen to share a small internal ID (0, 1, 2...),
-  producing wildly inflated, duplicated numbers (this was a real bug,
-  fixed once — don't reintroduce it). Still flagged as an estimate in
-  the README since `COLUMN_ID` itself is undocumented for this purpose.
+  starts with `H$`, resolved back to the real column by **name**, not by
+  `COLUMN_ID` — see `_get_hierarchy_sizes_by_name()`. This is the fix for
+  a second, related bug that shipped alongside the one above:
+  `COLUMN_ID` is only unique *within* a `TABLE_ID`; the `H$` pseudo-table
+  numbers its own columns 0, 1, 2, ... completely independently of the
+  real table's own `COLUMN_ID` sequence, so a real column's `COLUMN_ID`
+  and its own hierarchy segment's `COLUMN_ID` are generally *different
+  numbers*, even though `DIMENSION_NAME` (the real table's name) matches
+  on both sides. Joining on `(DIMENSION_NAME, COLUMN_ID)` as if the two
+  sequences lined up silently attached the wrong (or the same blended)
+  size to every column in a table — this was the previously-observed bug
+  where every column in a table showed nearly-identical `HierarchySize`
+  and real columns showed `0`. The fix: join the `H$` pseudo-table's own
+  segment sizes to the `H$` pseudo-table's own metadata row first (both
+  scoped to that same `H$...` `TABLE_ID`, so unambiguous), which
+  re-keys the result by `(DIMENSION_NAME, ATTRIBUTE_NAME)` — i.e. the
+  real `(Table, Column)` name — and match real columns against *that*.
+  Still flagged as an estimate in the README since `COLUMN_ID` itself is
+  undocumented for this purpose.
 - **Cardinality**: deliberately *not* derived from DMVs (the `H$`
   pseudo-table row counts are an unreliable proxy that requires
   fragile `TABLE_ID` string parsing and are off by a version-dependent
@@ -63,12 +103,25 @@ running Power BI Desktop process.
 - DMV query syntax is DMX-based SQL and does **not** support `JOIN`,
   `GROUP BY`, `LIKE`, `CAST`/`CONVERT` — all correlation across DMVs
   happens in pandas, not in the DMV query text.
+- **CLI console output** (`analyze_pbix.py`) has three sections, in
+  order: `TABLE SUMMARY` (per-table rollup), `TOP {--top} COLUMNS BY
+  TOTAL SIZE` (capped, for a quick glance), and `ALL TABLES & COLUMNS
+  (sorted by Total Size, then Cardinality)` (the *full*, uncapped
+  column list, sorted flat across the whole model rather than grouped
+  per table — mirrors DAX Studio's own VertiPaq Analyzer "Columns" tab).
+  `--export .xlsx` mirrors this with three sheets: `Tables`, `Columns`
+  (natural per-table order), `AllColumnsBySize` (the flat sorted view).
+  If you change the sort/columns of one, keep the export sheet and the
+  console section consistent with each other.
 
 ## If asked to extend this
 
 - **Relationship size / RI violations**: use `TMSCHEMA_RELATIONSHIPS`
   for metadata + `DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS` filtered to
-  `TABLE_ID` prefixed `R$` for size, same join pattern as hierarchies.
+  `TABLE_ID` prefixed `R$` for size, same join pattern as hierarchies —
+  and remember to route through the `R$` pseudo-table's own column
+  metadata to resolve by name, exactly like `H$`, rather than trusting
+  `COLUMN_ID` to line up with the real table's own numbering.
 - **Direct Lake / DirectQuery models**: the segment-based size DMVs
   don't apply the same way (Direct Lake pages columns into memory on
   demand rather than storing full VertiPaq segments). Don't silently
@@ -85,9 +138,23 @@ running Power BI Desktop process.
 
 ## Testing
 
-There's no automated test suite here — the only way to validate
-changes is running `analyze_pbix.py` against a real, open Power BI
-Desktop file on Windows. When making non-trivial changes, at least
-run `python -m py_compile *.py` to catch syntax errors before handing
-back to the user, since this sandbox can't exercise the actual
-ADOMD.NET connection (Linux, no Power BI Desktop, no .NET AS engine).
+There's no automated test suite here — the only way to fully validate
+changes end-to-end is running `uv run python analyze_pbix.py` against a
+real, open Power BI Desktop file on Windows (this sandbox can't
+exercise the actual ADOMD.NET connection: Linux, no Power BI Desktop,
+no .NET AS engine, and no `uv sync` without PyPI network access).
+
+For logic changes to `vertipaq_metrics.py` specifically (e.g. the
+hierarchy-size join), prefer a synthetic-DMV unit test over guessing:
+build small `pandas.DataFrame`s shaped like real
+`DISCOVER_STORAGE_TABLES` / `DISCOVER_STORAGE_TABLE_COLUMNS` /
+`DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS` output (including a `H$...`
+pseudo-table row whose `COLUMN_ID` sequence deliberately does *not*
+line up with the real table's own `COLUMN_ID`s, to catch the exact bug
+class described above), stub `PbiConnection.query_dmv`/`query_dax` to
+return them, and assert on the resulting DataFrame. This is how the
+hierarchy-size fix in this session was verified without a live PBIX.
+
+At minimum, always run `python -m py_compile *.py` (or `uv run python
+-m py_compile *.py`) to catch syntax errors before handing back to the
+user.

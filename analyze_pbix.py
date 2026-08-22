@@ -91,11 +91,28 @@ def main():
         disp_cols[c] = disp_cols[c].map(human_bytes)
     print(disp_cols.to_string(index=False))
 
+    # DAX Studio's own "Columns" tab of VertiPaq Analyzer doesn't group by
+    # table at all - it lists every column across the whole model in one
+    # flat list, sorted by size. This mirrors that: every table and every
+    # field, sorted by Total Size (descending), with Cardinality as the
+    # tie-breaker for columns that land on the same size.
+    sort_cols = ["TotalSize"]
+    if "Cardinality" in col_metrics.columns:
+        sort_cols.append("Cardinality")
+    print(f"\n=== ALL TABLES & COLUMNS (sorted by Total Size, then Cardinality) - {len(col_metrics)} columns ===")
+    disp_all = col_metrics.sort_values(sort_cols, ascending=False).copy()
+    for c in ["DataSize", "DictionarySize", "HierarchySize", "TotalSize"]:
+        disp_all[c] = disp_all[c].map(human_bytes)
+    print(disp_all.to_string(index=False))
+
     if args.export:
         if args.export.lower().endswith(".xlsx"):
             with pd.ExcelWriter(args.export) as writer:
                 table_summary.to_excel(writer, sheet_name="Tables", index=False)
                 col_metrics.to_excel(writer, sheet_name="Columns", index=False)
+                col_metrics.sort_values(sort_cols, ascending=False).to_excel(
+                    writer, sheet_name="AllColumnsBySize", index=False
+                )
         else:
             col_metrics.to_csv(args.export, index=False)
         print(f"\nExported full results to {args.export}")
