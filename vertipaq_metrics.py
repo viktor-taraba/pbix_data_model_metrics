@@ -25,17 +25,43 @@ DMVs used (all documented by Microsoft):
                                                        "H$" hierarchy structures,
                                                        summed = Hierarchy Size)
 
-Note on Hierarchy Size: the engine stores each column's auto-generated
-attribute hierarchy in a separate pseudo-table whose TABLE_ID is prefixed
-"H$". Those segment rows carry the real table's name in DIMENSION_NAME and
-the *same* internal COLUMN_ID as the real column - but COLUMN_ID is only
-unique *within* a table, not across the whole model, so the join is scoped
-to (DIMENSION_NAME, COLUMN_ID) together. Grouping by COLUMN_ID alone would
-silently merge unrelated columns in different tables that happen to share
-a small internal ID (0, 1, 2, ...), producing wildly inflated, duplicated
-numbers. COLUMN_ID is marked "for internal use" by Microsoft, so still
-treat Hierarchy Size as a very good estimate rather than an absolute
-guarantee across every engine version.
+Note on Hierarchy Size (IMPORTANT - this was a real bug, fixed once, do not
+reintroduce it): the engine stores each column's auto-generated attribute
+hierarchy in a separate pseudo-table whose TABLE_ID is prefixed "H$". Two
+separate things both need to be handled correctly here:
+
+1. DISCOVER_STORAGE_TABLE_COLUMNS lists the "H$" pseudo-table's OWN columns
+   as their own rows, alongside the real table's rows. If those aren't
+   excluded from the main per-column list, every real column ends up
+   duplicated by a "ghost" row (DATATYPE/COLUMN_ENCODING blank -> shows up
+   as "N/A"/"UNKNOWN", DICTIONARY_SIZE 0) that competes with the real row
+   for the hierarchy join below. The main column list is therefore
+   filtered down to rows whose TABLE_ID belongs to a *real* data table.
+
+2. COLUMN_ID is only unique *within* a TABLE_ID - it is not a stable,
+   shared identifier for "this same column" across two different
+   TABLE_IDs. The "H$" pseudo-table numbers its own columns 0, 1, 2, ...
+   independently of the real table's own COLUMN_ID sequence, so a real
+   column's COLUMN_ID and the COLUMN_ID of *its own* hierarchy segment are
+   generally different numbers, even though DIMENSION_NAME (the real
+   table's name) matches on both sides. Joining hierarchy segments to real
+   columns via (DIMENSION_NAME, COLUMN_ID) - as if the two COLUMN_ID
+   sequences lined up - silently attaches the wrong size (or the same
+   blended size) to every column in the table.
+
+   The only reliable link between an "H$" hierarchy segment and the real
+   column it belongs to is by NAME, routed through the "H$" pseudo-table's
+   own metadata row:
+       H$ metadata row:    (TABLE_ID=H$xxx, COLUMN_ID=k) -> (DIMENSION_NAME, ATTRIBUTE_NAME)
+       H$ segment sizes:   (TABLE_ID=H$xxx, COLUMN_ID=k) -> sum(USED_SIZE)
+   Joining those two *pseudo-table-scoped* IDs together first gives a
+   result keyed by (DIMENSION_NAME, ATTRIBUTE_NAME) - i.e. the real
+   (Table, Column) NAME - which real columns can then be matched against
+   safely, without ever assuming the two COLUMN_ID sequences correspond.
+
+   COLUMN_ID is marked "for internal use" by Microsoft, so still treat
+   Hierarchy Size as a very good estimate rather than an absolute
+   guarantee across every engine version.
 
 Note on Cardinality: deliberately not derived from the "H$" pseudo-table
 row counts (that requires fragile, version-dependent TABLE_ID string
@@ -58,6 +84,8 @@ ENCODING_MAP = {
     1: "HASH",
     2: "VALUE",
 }
+
+_PSEUDO_TABLE_PATTERN = r"^[A-Z]\$"
 
 
 def _get_storage_tables(conn: PbiConnection) -> pd.DataFrame:
@@ -137,6 +165,51 @@ def _get_cardinalities(conn: PbiConnection, table_column_pairs) -> dict[tuple[st
     return cardinalities
 
 
+def _get_hierarchy_sizes_by_name(storage_columns: pd.DataFrame, segments: pd.DataFrame) -> pd.Series:
+    """Return a Series of HierarchySize indexed by (Table, Column) NAME.
+
+    See the module docstring's "Note on Hierarchy Size" for why this has to
+    go by name instead of by COLUMN_ID: the "H$" pseudo-table's own COLUMN_ID
+    sequence is independent of the real table's COLUMN_ID sequence, so the
+    two can only be reconciled through the "H$" pseudo-table's own metadata
+    row (which carries the real column's DIMENSION_NAME/ATTRIBUTE_NAME).
+    """
+    # The "H$" pseudo-table's own column metadata: (TABLE_ID, COLUMN_ID) -> name
+    hier_columns = storage_columns[
+        storage_columns["TABLE_ID"].astype(str).str.startswith("H$")
+    ].copy()
+    if hier_columns.empty:
+        return pd.Series(dtype="int64", name="HierarchySize")
+
+    hier_columns["TABLE_ID"] = hier_columns["TABLE_ID"].astype(str)
+    hier_columns["COLUMN_ID"] = hier_columns["COLUMN_ID"].astype(str)
+
+    # The "H$" pseudo-table's own segment sizes: (TABLE_ID, COLUMN_ID) -> bytes
+    hier_segments = segments[
+        segments["TABLE_ID"].astype(str).str.startswith("H$")
+    ].copy()
+    hier_segments["TABLE_ID"] = hier_segments["TABLE_ID"].astype(str)
+    hier_segments["COLUMN_ID"] = hier_segments["COLUMN_ID"].astype(str)
+    hier_seg_size = (
+        hier_segments.groupby(["TABLE_ID", "COLUMN_ID"])["USED_SIZE"]
+        .sum()
+        .rename("HierarchySize")
+    )
+
+    # Join on the pseudo-table's OWN (TABLE_ID, COLUMN_ID) - both sides are
+    # scoped to the same "H$..." TABLE_ID, so this join is unambiguous -
+    # then the result is naturally keyed by the real (DIMENSION_NAME,
+    # ATTRIBUTE_NAME), i.e. real (Table, Column) name.
+    hier_by_name = hier_columns.merge(
+        hier_seg_size, left_on=["TABLE_ID", "COLUMN_ID"], right_index=True, how="inner"
+    )
+
+    return (
+        hier_by_name.groupby(["DIMENSION_NAME", "ATTRIBUTE_NAME"])["HierarchySize"]
+        .sum()
+    )
+
+
 def get_column_metrics(conn: PbiConnection, include_cardinality: bool = True) -> pd.DataFrame:
     """Main entry point: returns a tidy DataFrame, one row per column,
     with Data/Dictionary/Hierarchy/Total size in bytes plus cardinality."""
@@ -148,13 +221,13 @@ def get_column_metrics(conn: PbiConnection, include_cardinality: bool = True) ->
     # Row counts for real data tables (exclude internal $-prefixed pseudo
     # tables like H$..., U$..., R$... which represent hierarchies/relationships)
     real_tables = storage_tables[
-        ~storage_tables["TABLE_ID"].astype(str).str.contains(r"^[A-Z]\$", regex=True)
+        ~storage_tables["TABLE_ID"].astype(str).str.contains(_PSEUDO_TABLE_PATTERN, regex=True)
     ].copy()
     row_counts = real_tables.groupby("DIMENSION_NAME")["ROWS_COUNT"].max().to_dict()
+    real_table_ids = set(real_tables["TABLE_ID"].astype(str))
 
     # Data size: sum USED_SIZE per (TABLE_ID, COLUMN_ID) for segments whose
     # TABLE_ID belongs to a real data table
-    real_table_ids = set(real_tables["TABLE_ID"].astype(str))
     data_segments = segments[segments["TABLE_ID"].astype(str).isin(real_table_ids)].copy()
     data_segments["TABLE_ID"] = data_segments["TABLE_ID"].astype(str)
     data_segments["COLUMN_ID"] = data_segments["COLUMN_ID"].astype(str)
@@ -164,24 +237,23 @@ def get_column_metrics(conn: PbiConnection, include_cardinality: bool = True) ->
         .rename("DataSize")
     )
 
-    # Hierarchy size: sum USED_SIZE for segments belonging to "H$" pseudo
-    # tables, joined back to the real column via COLUMN_ID *scoped to the
-    # same table*. COLUMN_ID is only unique within a table, not globally -
-    # grouping by COLUMN_ID alone (without DIMENSION_NAME) causes unrelated
-    # columns in different tables that happen to share a small internal ID
-    # (0, 1, 2, ...) to get summed together, wildly inflating and duplicating
-    # this figure across the model. DIMENSION_NAME on the "H$" pseudo-table
-    # rows carries the name of the real table the hierarchy belongs to.
-    hier_segments = segments[segments["TABLE_ID"].astype(str).str.startswith("H$")].copy()
-    hier_segments["COLUMN_ID"] = hier_segments["COLUMN_ID"].astype(str)
-    hier_size = (
-        hier_segments.groupby(["DIMENSION_NAME", "COLUMN_ID"])["USED_SIZE"]
-        .sum()
-        .rename("HierarchySize")
-    )
+    # Hierarchy size, resolved to real (Table, Column) NAMES - see
+    # _get_hierarchy_sizes_by_name() and the module docstring for why this
+    # can't be done via COLUMN_ID matching.
+    hier_size = _get_hierarchy_sizes_by_name(storage_columns, segments)
 
-    # Build the base column list with readable names, from DISCOVER_STORAGE_TABLE_COLUMNS
-    base = storage_columns[~storage_columns["ISROWNUMBER"].fillna(False)].copy()
+    # Build the base column list with readable names, from
+    # DISCOVER_STORAGE_TABLE_COLUMNS - restricted to REAL tables only.
+    # DISCOVER_STORAGE_TABLE_COLUMNS also lists the engine's internal
+    # "H$"/"U$"/"R$" pseudo-tables' own columns as their own rows; if those
+    # aren't excluded here, every real column ends up duplicated by a
+    # "ghost" row (DATATYPE/COLUMN_ENCODING blank -> "N/A"/"UNKNOWN",
+    # DICTIONARY_SIZE 0) sitting right alongside the real one. This was a
+    # real, observed bug: don't reintroduce it by removing this filter.
+    base = storage_columns[
+        (~storage_columns["ISROWNUMBER"].fillna(False))
+        & (storage_columns["TABLE_ID"].astype(str).isin(real_table_ids))
+    ].copy()
     base = base.rename(columns={
         "DIMENSION_NAME": "Table",
         "ATTRIBUTE_NAME": "Column",
@@ -197,7 +269,7 @@ def get_column_metrics(conn: PbiConnection, include_cardinality: bool = True) ->
         data_size, left_on=["TABLE_ID", "COLUMN_ID"], right_index=True, how="left"
     )
     base = base.merge(
-        hier_size, left_on=["Table", "COLUMN_ID"], right_index=True, how="left"
+        hier_size, left_on=["Table", "Column"], right_index=True, how="left"
     )
 
     base["DataSize"] = base["DataSize"].fillna(0).astype("int64")
