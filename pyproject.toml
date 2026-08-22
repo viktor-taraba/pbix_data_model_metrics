@@ -1,0 +1,13 @@
+[project]
+name = "pbix-data-model-metrics"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "openpyxl>=3.1.5",
+    "pandas>=3.0.5",
+    "psutil>=7.2.2",
+    "python-dotenv>=1.2.3",
+    "pythonnet>=3.1.0",
+]
