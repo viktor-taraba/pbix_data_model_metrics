@@ -384,56 +384,89 @@ def get_table_summary(column_metrics: pd.DataFrame) -> pd.DataFrame:
     return summary.sort_values("TotalSize", ascending=False).reset_index()
 
 
-def _timestamps_from_dmv(conn: PbiConnection, dmv_sql: str, column: str):
+def _timestamps_from_dmv(
+    conn: PbiConnection, dmv_sql: str, column: str, source_label: str, diagnostics: list[str]
+):
     """Run a DMV query and return the max non-null timestamp in `column`,
-    or None if the query failed, returned nothing, lacked the column, or
-    every value in it was null. A helper shared by the two refresh-lookup
-    strategies below, since both need identical "be quiet and try the next
-    thing" handling."""
+    or None if it couldn't be determined - and, unlike a plain best-effort
+    try/except, always append a specific, human-readable reason to
+    `diagnostics` when that happens: query failed outright, came back
+    empty, didn't have the expected column at all, or had the column but
+    every value in it was null/unparseable. These are meaningfully
+    different failures and collapsing them into one silent `None` is
+    exactly what made the previous version of this lookup impossible to
+    debug from the outside."""
     try:
         df = conn.query_dmv(dmv_sql)
-    except Exception:
+    except Exception as exc:
+        diagnostics.append(f"{source_label}: query failed - {type(exc).__name__}: {exc}")
         return None
-    if df is None or df.empty or column not in df.columns:
+    if df is None or df.empty:
+        diagnostics.append(f"{source_label}: query returned no rows")
+        return None
+    if column not in df.columns:
+        diagnostics.append(
+            f"{source_label}: column '{column}' not present in result "
+            f"(columns returned: {list(df.columns)})"
+        )
         return None
     timestamps = pd.to_datetime(df[column], errors="coerce").dropna()
     if timestamps.empty:
+        diagnostics.append(
+            f"{source_label}: column '{column}' present but every value was null/unparseable"
+        )
         return None
     return timestamps.max()
 
 
-def _get_last_data_refresh(conn: PbiConnection):
+def _get_last_data_refresh(conn: PbiConnection, diagnostics: list[str] | None = None):
     """Best-effort lookup of the model's last data-refresh timestamp.
 
-    Tries two documented rowsets, in order:
+    Tries three documented rowsets, in order, most-authoritative first:
 
-    1. $SYSTEM.MDSCHEMA_CUBES's LAST_DATA_UPDATE - the traditional
-       multidimensional-cube metadata field. For Tabular models (what
-       Power BI Desktop actually runs), this is frequently present as a
-       column but *null* for every row - the query succeeds, so no
-       exception is raised, but there's nothing usable in it.
-    2. $SYSTEM.TMSCHEMA_TABLES's ModifiedTime - Tabular's own internal
-       metadata rowset, with one row per table. This is what DAX
-       Studio's own VertiPaq Analyzer "Last Data Refresh" figure is
-       actually built from: ModifiedTime tracks when each table's data
-       was last processed/refreshed. (Its sibling column,
-       StructureModifiedTime, tracks schema/structure changes instead -
-       e.g. renaming a column without touching the data - so it is
-       deliberately NOT used here; that would overstate how "fresh" the
-       data itself is.) The max ModifiedTime across all tables is the
-       model's overall last data refresh.
+    1. $SYSTEM.TMSCHEMA_PARTITIONS's RefreshedTime - each partition's own
+       "when was this data last processed" timestamp; this is the literal,
+       documented meaning of "refresh" in the Tabular Object Model
+       (`Partition.RefreshedTime`), so it's tried first. Max across all
+       partitions = the model's overall last data refresh.
+    2. $SYSTEM.MDSCHEMA_CUBES's LAST_DATA_UPDATE - traditional
+       multidimensional-cube metadata. On Tabular models (what Power BI
+       Desktop actually runs) this column is frequently present but
+       *null* for every row - the query still succeeds, there's just
+       nothing usable in it, so falling through past this is expected and
+       normal, not a sign anything is broken.
+    3. $SYSTEM.TMSCHEMA_TABLES's ModifiedTime - a broader "last modified"
+       at the table level that covers data AND structure changes (unlike
+       its sibling StructureModifiedTime, which is structure-only and
+       deliberately not used here). Kept only as a last resort since it
+       can overstate freshness after a schema-only edit with no real data
+       refresh.
 
-    Returns a pandas.Timestamp, or None if neither rowset yielded one
-    (older engine versions, a locked-down role, or a model that's never
-    been refreshed)."""
-    ts = _timestamps_from_dmv(conn, "SELECT * FROM $SYSTEM.MDSCHEMA_CUBES", "LAST_DATA_UPDATE")
-    if ts is not None:
-        return ts
-    return _timestamps_from_dmv(conn, "SELECT * FROM $SYSTEM.TMSCHEMA_TABLES", "ModifiedTime")
+    Returns a pandas.Timestamp, or None if none of the three yielded one.
+    Every rowset that didn't pan out gets a specific reason appended to
+    `diagnostics` (if given) - always check that when this returns None,
+    instead of assuming the model just "has no refresh info".
+    """
+    if diagnostics is None:
+        diagnostics = []
+
+    for dmv_sql, column, label in (
+        ("SELECT * FROM $SYSTEM.TMSCHEMA_PARTITIONS", "RefreshedTime", "TMSCHEMA_PARTITIONS.RefreshedTime"),
+        ("SELECT * FROM $SYSTEM.MDSCHEMA_CUBES", "LAST_DATA_UPDATE", "MDSCHEMA_CUBES.LAST_DATA_UPDATE"),
+        ("SELECT * FROM $SYSTEM.TMSCHEMA_TABLES", "ModifiedTime", "TMSCHEMA_TABLES.ModifiedTime"),
+    ):
+        ts = _timestamps_from_dmv(conn, dmv_sql, column, label, diagnostics)
+        if ts is not None:
+            return ts
+
+    return None
 
 
 def get_model_summary(
-    conn: PbiConnection, column_metrics: pd.DataFrame, table_summary: pd.DataFrame
+    conn: PbiConnection,
+    column_metrics: pd.DataFrame,
+    table_summary: pd.DataFrame,
+    refresh_diagnostics: list[str] | None = None,
 ) -> dict:
     """High-level, whole-model stats for the report's summary section:
     total in-memory size, last data refresh, table count, column count.
@@ -444,12 +477,18 @@ def get_model_summary(
     Analyzer. It does not include relationship-segment ("R$") or other
     non-column engine overhead, so it's a close lower bound on the model's
     real total memory footprint, not an exact one.
+
+    refresh_diagnostics: if given (e.g. an empty list you hold onto), it
+    gets filled in-place with one diagnostic string per data-source that
+    was tried and didn't pan out while looking up LastDataRefresh - check
+    this whenever LastDataRefresh comes back None instead of assuming the
+    model simply has no refresh info available.
     """
     return {
         "TotalSize": int(column_metrics["TotalSize"].sum()),
         "NumTables": int(table_summary["Table"].nunique()),
         "NumColumns": int(len(column_metrics)),
-        "LastDataRefresh": _get_last_data_refresh(conn),
+        "LastDataRefresh": _get_last_data_refresh(conn, refresh_diagnostics),
     }
 
 

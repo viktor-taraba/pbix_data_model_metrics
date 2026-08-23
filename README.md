@@ -14,7 +14,10 @@ than ADOMD.NET / AMO (the same client libraries DAX Studio itself uses).
 1. **Discovery** (`pbi_discover.py`) - scans running processes for
    `msmdsrv.exe` instances launched by Power BI Desktop, and reads the
    port number Windows assigned it from
-   `...\AnalysisServicesWorkspaces\<guid>\Data\msmdsrv.port.txt`.
+   `...\AnalysisServicesWorkspaces\<guid>\Data\msmdsrv.port.txt`. Also
+   does a best-effort lookup of the actual .pbix file's name/path/size
+   by inspecting the parent Power BI Desktop process's open file
+   handles (it keeps the .pbix locked while editing).
 2. **Connection** (`pbi_connection.py`) - opens an ADOMD.NET connection
    to `localhost:<port>` via `pythonnet`, auto-detecting the catalog
    (database) name if you don't supply one.
@@ -122,13 +125,15 @@ Color legend:
 
 Each run prints five sections:
 
-0. **MODEL SUMMARY** — a small panel with the total model size in
+0. **MODEL SUMMARY** — a small panel with the .pbix file's name and
+   size on disk (detected by inspecting Power BI Desktop's open file
+   handles — see "PBIX file detection" below), the total model size in
    memory (sum of every column's Data + Dictionary + Hierarchy size),
-   the model's last data refresh timestamp (from
-   `$SYSTEM.MDSCHEMA_CUBES`'s `LAST_DATA_UPDATE`), and the table/column
-   counts — followed by **SIZE DISTRIBUTION BY TABLE**, a horizontal
-   bar chart of each table's total size (biggest first), with row
-   count and column count as data labels next to the size.
+   the model's last data refresh timestamp (see "Last data refresh"
+   below), and the table/column counts — followed by **SIZE
+   DISTRIBUTION BY TABLE**, a horizontal bar chart of each table's
+   total size (biggest first), with row count and column count as
+   data labels next to the size.
 1. **TABLE SUMMARY** — one row per table, rolled up from the column
    metrics (row count, total data/dictionary/hierarchy/total size,
    column count, % of DB).
@@ -154,16 +159,34 @@ separate sheets: `Overview` (the model summary numbers), `Tables`,
 sort), `AllColumnsBySize` (section 3, flat and size-sorted), and
 `ByTableThenField` (section 4, grouped/ordered as above).
 
-Note on "last data refresh": this is looked up two ways, in order:
-`$SYSTEM.MDSCHEMA_CUBES`'s `LAST_DATA_UPDATE` first, then
-`$SYSTEM.TMSCHEMA_TABLES`'s `ModifiedTime` (max across all tables) as a
-fallback. The first field is traditional multidimensional-cube
-metadata and is frequently *present but null* on Tabular models (what
-Power BI Desktop actually runs) - the query still succeeds, there's
-just nothing in it, so falling back to the second is expected and
-normal, not a sign anything is broken. If it still shows "unknown",
-neither rowset had anything usable (older engine version, locked-down
-role, or a model that's genuinely never been refreshed).
+Note on "PBIX file detection": the name/size shown come from inspecting
+which file handles the parent Power BI Desktop process has open (it
+keeps the .pbix locked for the whole editing session), not from any
+DMV. This works even when connecting via `--port` directly, as long as
+that port still matches a running, discoverable instance. It shows as
+"unknown" for a never-saved ("Untitled.pbix") report, or if Windows
+denies the handle-enumeration call this relies on.
+
+Note on "last data refresh": this is looked up via three documented
+rowsets, tried in order, most-authoritative first:
+1. `$SYSTEM.TMSCHEMA_PARTITIONS`'s `RefreshedTime` (max across all
+   partitions) - the literal, documented meaning of "refresh" in the
+   Tabular Object Model.
+2. `$SYSTEM.MDSCHEMA_CUBES`'s `LAST_DATA_UPDATE` - traditional
+   multidimensional-cube metadata; frequently *present but null* on
+   Tabular models (what Power BI Desktop actually runs), so falling
+   through past this is expected and normal, not a sign anything is
+   broken.
+3. `$SYSTEM.TMSCHEMA_TABLES`'s `ModifiedTime` (max across all tables)
+   as a last resort.
+
+If it still shows "unknown", none of the three had anything usable -
+and unlike earlier versions of this tool, that's no longer silent:
+run without `--no-color` piped through, and a
+`[!] Could not determine last data refresh` block on stderr lists the
+*specific* reason each of the three sources didn't work (query error,
+empty result, missing column, or an all-null column) - that's the
+place to look, not something to just accept as "unknown" again.
 
 ## Notes / limitations
 

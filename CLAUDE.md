@@ -42,9 +42,9 @@ This project uses **uv**, not raw `pip`. Source of truth is
 
 | File | Responsibility |
 |---|---|
-| `pbi_discover.py` | Finds running `msmdsrv.exe` processes launched by Power BI Desktop, reads `msmdsrv.port.txt` from the per-file workspace folder under `%LOCALAPPDATA%\Microsoft\Power BI Desktop\AnalysisServicesWorkspaces\` to get the TCP port. Falls back to scanning that folder directly if process introspection fails (e.g. permissions). |
+| `pbi_discover.py` | Finds running `msmdsrv.exe` processes launched by Power BI Desktop, reads `msmdsrv.port.txt` from the per-file workspace folder under `%LOCALAPPDATA%\Microsoft\Power BI Desktop\AnalysisServicesWorkspaces\` to get the TCP port. Falls back to scanning that folder directly if process introspection fails (e.g. permissions). Also resolves the actual .pbix file's name/path/size (`_pbix_file_info_for_parent()`) via `psutil.Process.open_files()` on the parent PBIDesktop.exe process - the only place that knows the real file, since the msmdsrv workspace folder is an anonymized internal copy. |
 | `pbi_connection.py` | Thin ADOMD.NET wrapper via `pythonnet` (`clr.AddReference`). Locates `Microsoft.AnalysisServices.AdomdClient.dll` (bundled with Power BI Desktop, or the standalone AMO/ADOMD.NET redistributable), opens a connection, auto-detects the catalog/database name via `$SYSTEM.DBSCHEMA_CATALOGS` if not given. Exposes `query_dmv()` and `query_dax()`, both returning `pandas.DataFrame`. |
-| `vertipaq_metrics.py` | The actual analyzer logic. Pulls `DISCOVER_STORAGE_TABLES`, `DISCOVER_STORAGE_TABLE_COLUMNS`, `DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS` DMVs and joins them in pandas (DMV SQL doesn't support real joins). Runs one `EVALUATE ROW(..., DISTINCTCOUNT(...))` DAX query per table for exact cardinality. Returns tidy per-column and per-table DataFrames, plus `order_by_table_size_then_field_size()` for the table-grouped ordering used in console section 4 / export sheet `ByTableThenField`, and `get_model_summary()` for the whole-model stats (total size, last data refresh via `$SYSTEM.MDSCHEMA_CUBES`, table/column counts) used in console section 0. |
+| `vertipaq_metrics.py` | The actual analyzer logic. Pulls `DISCOVER_STORAGE_TABLES`, `DISCOVER_STORAGE_TABLE_COLUMNS`, `DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS` DMVs and joins them in pandas (DMV SQL doesn't support real joins). Runs one `EVALUATE ROW(..., DISTINCTCOUNT(...))` DAX query per table for exact cardinality. Returns tidy per-column and per-table DataFrames, plus `order_by_table_size_then_field_size()` for the table-grouped ordering used in console section 4 / export sheet `ByTableThenField`, and `get_model_summary()` for the whole-model stats (total size, last data refresh via a 3-source DMV fallback chain, table/column counts) used in console section 0. |
 | `pbi_report.py` | Colorized console rendering via `rich` (`print_table_summary`, `print_columns_table`, `print_grouped_by_table`). Every function degrades to plain `to_string()` output if `rich` isn't installed (checked via `pbi_report.RICH_AVAILABLE`) - keep that fallback working when touching this file, since `rich` is a real but non-critical dependency. |
 | `analyze_pbix.py` | CLI entry point. Auto-discovers/prompts for a running instance, prints the four console sections via `pbi_report`, optional `--export metrics.xlsx`/`.csv`, `--no-color` to force plain text. |
 | `README.md` | End-user setup + usage instructions. |
@@ -122,8 +122,9 @@ This project uses **uv**, not raw `pip`. Source of truth is
   `GROUP BY`, `LIKE`, `CAST`/`CONVERT` — all correlation across DMVs
   happens in pandas, not in the DMV query text.
 - **CLI console output** (`analyze_pbix.py` + `pbi_report.py`) has five
-  sections, in order: section 0, `MODEL SUMMARY` (total in-memory
-  size, last data refresh, table/column counts) followed immediately by
+  sections, in order: section 0, `MODEL SUMMARY` (pbix file name/size,
+  total in-memory size, last data refresh, table/column counts)
+  followed immediately by
   `SIZE DISTRIBUTION BY TABLE` (a horizontal bar chart, biggest table
   first, row/column counts as data labels) - then `TABLE SUMMARY`
   (per-table rollup), `TOP {--top} COLUMNS BY TOTAL SIZE` (capped, for
@@ -147,29 +148,34 @@ This project uses **uv**, not raw `pip`. Source of truth is
   overhead or other non-column engine memory, so treat it as a close
   lower bound, not an exact process memory figure - see
   `get_model_summary()`'s docstring.
-- **"Last data refresh"** is looked up two ways, in order, via
-  `_get_last_data_refresh()` / the shared `_timestamps_from_dmv()`
-  helper:
-  1. `$SYSTEM.MDSCHEMA_CUBES`'s `LAST_DATA_UPDATE`.
-  2. `$SYSTEM.TMSCHEMA_TABLES`'s `ModifiedTime` (max across all tables)
-     as a fallback.
-  **This fallback is not optional/cosmetic - it's the common case.**
-  `LAST_DATA_UPDATE` is traditional multidimensional-cube metadata; on
-  Tabular models (i.e. every Power BI Desktop model) the column is
-  frequently present-but-null for every row, so the query succeeds
-  with no exception and (1) silently yields nothing. `ModifiedTime` in
-  `TMSCHEMA_TABLES` is the field DAX Studio's own VertiPaq Analyzer
-  actually surfaces as "Last Data Refresh" - deliberately not its
-  sibling `StructureModifiedTime`, which tracks schema/structure edits
-  (e.g. renaming a column) rather than data refreshes and would
-  overstate freshness if used here. Verified against a real DAX
-  Studio side-by-side comparison during development: DAX Studio showed
-  `29.11.2022 1:33:48 +02:00`; this tool's fallback path (1) returning
-  nothing then (2) resolving via `TMSCHEMA_TABLES` reproduced the same
-  `2022-11-29 01:33:48` (naive, no offset - see below). If you add a
-  third fallback source, keep it behind `_timestamps_from_dmv()` so it
-  gets the same quiet must-actually-have-a-non-null-value treatment as
-  the first two, rather than a bespoke try/except.
+- **"Last data refresh"** is looked up via `_get_last_data_refresh()` /
+  the shared `_timestamps_from_dmv()` helper, trying three documented
+  rowsets in order, most-authoritative first:
+  1. `$SYSTEM.TMSCHEMA_PARTITIONS`'s `RefreshedTime` (max across all
+     partitions) - the literal, documented meaning of "refresh" in the
+     Tabular Object Model (`Partition.RefreshedTime`).
+  2. `$SYSTEM.MDSCHEMA_CUBES`'s `LAST_DATA_UPDATE` - traditional
+     multidimensional-cube metadata; on Tabular models (every Power BI
+     Desktop model) this is frequently present-but-null for every row,
+     so falling through past it is expected and normal.
+  3. `$SYSTEM.TMSCHEMA_TABLES`'s `ModifiedTime` (max across all tables)
+     as a last resort - deliberately not its sibling
+     `StructureModifiedTime`, which tracks schema/structure edits
+     rather than data refreshes and would overstate freshness.
+
+  **This went through one real, user-reported failure already** (the
+  first version of this lookup only tried #2 then #3, both untested
+  against a real engine, and it came back "unknown" against a real
+  report even though DAX Studio showed a value). Don't repeat that
+  mistake: `_timestamps_from_dmv()` takes a `diagnostics: list[str]`
+  and appends a *specific* reason every time a source doesn't pan out
+  (query raised, empty result, column missing, column all-null) -
+  `get_model_summary()`'s `refresh_diagnostics` parameter surfaces this
+  all the way up to `analyze_pbix.py`, which prints it to stderr
+  whenever `LastDataRefresh` is `None`. If you add a fourth fallback
+  source, or if this fails again on some other real report, that
+  diagnostics list is the actual evidence to look at - don't guess at
+  a fifth DMV/column name without it.
   **Timezone note:** the value returned is naive (no UTC offset) -
   ADOMD.NET/pythonnet hands back the underlying .NET `DateTime` as-is,
   which doesn't carry timezone info the way DAX Studio's UI-level
@@ -177,6 +183,15 @@ This project uses **uv**, not raw `pip`. Source of truth is
   without checking against the specific engine/session - if exact
   offset handling matters for a future change, that needs its own
   investigation rather than a guessed `tz_localize()`.
+- **PBIX name/size** in the section-0 summary come from
+  `pbi_discover._pbix_file_info_for_parent()`, via
+  `psutil.Process.open_files()` on the parent PBIDesktop.exe process -
+  not from any DMV. `analyze_pbix.py` re-runs discovery even when
+  `--port` was passed explicitly (matching the given port against
+  `find_all()`'s results) purely to populate these fields; if no match
+  is found (or the fields come back `None` - unsaved report, or
+  Windows denies the handle-enumeration call), `pbi_report` shows
+  "unknown" rather than failing.
 - **Colors** are handled entirely in `pbi_report.py` via `rich`; there's
   a plain-text fallback path (`RICH_AVAILABLE = False`) exercised both
   when `rich` isn't installed and when the user passes `--no-color`

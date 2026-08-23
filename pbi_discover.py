@@ -22,6 +22,12 @@ This module enumerates running msmdsrv.exe processes, reads that
 port file for each one, and (optionally) asks the engine itself for
 the catalog/database name so you don't have to guess it.
 
+It also does a best-effort lookup of the actual .pbix file each
+instance belongs to (name, full path, size on disk) - see
+_pbix_file_info_for_parent() - by inspecting which file handles the
+parent PBIDesktop.exe process has open, since Power BI Desktop keeps
+the .pbix file itself open (locked) while it's being edited.
+
 Requires: psutil
 """
 
@@ -42,6 +48,9 @@ class PbiInstance:
     workspace_dir: str
     port: Optional[int]
     pbix_title: Optional[str] = None  # best-effort, from the parent PBIDesktop.exe window/process
+    pbix_path: Optional[str] = None  # full path to the .pbix file, if it could be determined
+    pbix_name: Optional[str] = None  # just the filename, e.g. "MyReport.pbix"
+    pbix_size_bytes: Optional[int] = None  # size on disk of the .pbix file, if known
 
     def __str__(self) -> str:
         title = f" ({self.pbix_title})" if self.pbix_title else ""
@@ -90,6 +99,44 @@ def _guess_title_for_parent(pid: int) -> Optional[str]:
     return None
 
 
+def _pbix_file_info_for_parent(pid: int) -> tuple[Optional[str], Optional[str], Optional[int]]:
+    """Best-effort: find the parent PBIDesktop.exe process and inspect its
+    open file handles for the actual .pbix file it's editing, via
+    psutil.Process.open_files(). Power BI Desktop keeps the .pbix file
+    itself open (locked) for the whole editing session, so this is a
+    reliable way to get the real file - name, full path, and size on
+    disk - without needing the user to tell us, unlike the msmdsrv.exe
+    workspace folder (which is an internal, randomly-named copy that
+    reveals nothing about the original file).
+
+    Returns (name, full_path, size_bytes), any/all of which may be None:
+    - A brand-new, never-saved report ("Untitled.pbix") has no file on
+      disk at all, so there's nothing to find here.
+    - `open_files()` itself can raise psutil.AccessDenied on some Windows
+      configurations even for the current user's own processes, since it
+      relies on an OS-level handle enumeration API that isn't always
+      unrestricted - that's treated as "couldn't determine it", not an
+      error worth surfacing to the end user.
+    """
+    try:
+        proc = psutil.Process(pid)
+        parent = proc.parent()
+        if not parent or "pbidesktop" not in parent.name().lower():
+            return None, None, None
+
+        for f in parent.open_files():
+            if f.path.lower().endswith(".pbix"):
+                name = os.path.basename(f.path)
+                try:
+                    size = os.path.getsize(f.path)
+                except OSError:
+                    size = None
+                return name, f.path, size
+    except Exception:
+        pass
+    return None, None, None
+
+
 def find_running_instances() -> list[PbiInstance]:
     """Scan all running processes for msmdsrv.exe instances that look like
     they were launched by Power BI Desktop, and resolve their port."""
@@ -113,11 +160,15 @@ def find_running_instances() -> list[PbiInstance]:
 
             port = _read_port_file(workspace_dir)
             title = _guess_title_for_parent(proc.info["pid"])
+            pbix_name, pbix_path, pbix_size = _pbix_file_info_for_parent(proc.info["pid"])
             results.append(PbiInstance(
                 pid=proc.info["pid"],
                 workspace_dir=workspace_dir,
                 port=port,
-                pbix_title=title,
+                pbix_title=pbix_name or title,
+                pbix_path=pbix_path,
+                pbix_name=pbix_name,
+                pbix_size_bytes=pbix_size,
             ))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue

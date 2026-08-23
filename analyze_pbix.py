@@ -72,6 +72,12 @@ def main():
 
     if args.port:
         port = args.port
+        # We bypassed choose_instance(), but discovery is cheap (just a
+        # process scan) - run it anyway purely to enrich the report with
+        # the actual .pbix file's name/size if we can match this port to
+        # a running instance, rather than leaving those fields blank just
+        # because the user already knew the port.
+        inst = next((i for i in find_all() if i.port == port), None)
     else:
         inst = choose_instance()
         port = inst.port
@@ -89,7 +95,15 @@ def main():
         table_summary = get_table_summary(col_metrics)
         # Fetched inside the `with` block since it needs another DMV round
         # trip on the still-open connection.
-        model_summary = get_model_summary(conn, col_metrics, table_summary)
+        refresh_diagnostics: list[str] = []
+        model_summary = get_model_summary(
+            conn, col_metrics, table_summary, refresh_diagnostics=refresh_diagnostics
+        )
+        # The .pbix file's name/size comes from process introspection
+        # (pbi_discover), not the DMV connection - merge it in here so
+        # print_model_summary() has one dict with everything it needs.
+        model_summary["PbixName"] = getattr(inst, "pbix_name", None) if inst else None
+        model_summary["PbixSizeBytes"] = getattr(inst, "pbix_size_bytes", None) if inst else None
 
     if cardinality_warnings:
         n_failed = len(cardinality_warnings)
@@ -106,6 +120,19 @@ def main():
         print(
             "    (Those columns show '-' for Cardinality below instead of "
             "silently looking like every column succeeded.)\n",
+            file=sys.stderr,
+        )
+
+    if model_summary["LastDataRefresh"] is None and refresh_diagnostics:
+        print(
+            "\n[!] Could not determine last data refresh. Reasons per source tried:",
+            file=sys.stderr,
+        )
+        for msg in refresh_diagnostics:
+            print(f"    - {msg}", file=sys.stderr)
+        print(
+            "    (Shows as 'unknown' in MODEL SUMMARY below instead of silently "
+            "picking a wrong date.)\n",
             file=sys.stderr,
         )
 
@@ -143,6 +170,8 @@ def main():
         if args.export.lower().endswith(".xlsx"):
             with pd.ExcelWriter(args.export) as writer:
                 overview = pd.DataFrame([{
+                    "PBIX Name": model_summary.get("PbixName"),
+                    "PBIX Size (bytes)": model_summary.get("PbixSizeBytes"),
                     "Total Model Size (bytes)": model_summary["TotalSize"],
                     "Last Data Refresh": model_summary["LastDataRefresh"],
                     "Tables": model_summary["NumTables"],
