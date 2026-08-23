@@ -118,9 +118,17 @@ Color legend:
 | `% of DB` (table summary) | bold red ≥ 25%, yellow ≥ 10%, green ≥ 1%, dim below that |
 | `Encoding` | `VALUE` = bold green, `HASH` = cyan, `UNKNOWN` = bold red |
 | `Cardinality` | white ≤ 100k, yellow 100k–1M, red > 1M, dark red > 2M |
+| Size Distribution bar (model summary) | same scale as size cells - the bar's own color reflects that table's Total Size |
 
-Each run prints four sections:
+Each run prints five sections:
 
+0. **MODEL SUMMARY** — a small panel with the total model size in
+   memory (sum of every column's Data + Dictionary + Hierarchy size),
+   the model's last data refresh timestamp (from
+   `$SYSTEM.MDSCHEMA_CUBES`'s `LAST_DATA_UPDATE`), and the table/column
+   counts — followed by **SIZE DISTRIBUTION BY TABLE**, a horizontal
+   bar chart of each table's total size (biggest first), with row
+   count and column count as data labels next to the size.
 1. **TABLE SUMMARY** — one row per table, rolled up from the column
    metrics (row count, total data/dictionary/hierarchy/total size,
    column count, % of DB).
@@ -140,11 +148,22 @@ Each run prints four sections:
    largest first. Useful when you want to review a model table-by-table
    rather than as one flat, cross-table list.
 
-When exporting to `.xlsx`, all four views are written out as separate
-sheets: `Tables`, `Columns` (per-table natural order matching the
-column metrics' own sort), `AllColumnsBySize` (section 3, flat and
-size-sorted), and `ByTableThenField` (section 4, grouped/ordered as
-above).
+When exporting to `.xlsx`, all of the above are written out as
+separate sheets: `Overview` (the model summary numbers), `Tables`,
+`Columns` (per-table natural order matching the column metrics' own
+sort), `AllColumnsBySize` (section 3, flat and size-sorted), and
+`ByTableThenField` (section 4, grouped/ordered as above).
+
+Note on "last data refresh": this is looked up two ways, in order:
+`$SYSTEM.MDSCHEMA_CUBES`'s `LAST_DATA_UPDATE` first, then
+`$SYSTEM.TMSCHEMA_TABLES`'s `ModifiedTime` (max across all tables) as a
+fallback. The first field is traditional multidimensional-cube
+metadata and is frequently *present but null* on Tabular models (what
+Power BI Desktop actually runs) - the query still succeeds, there's
+just nothing in it, so falling back to the second is expected and
+normal, not a sign anything is broken. If it still shows "unknown",
+neither rowset had anything usable (older engine version, locked-down
+role, or a model that's genuinely never been refreshed).
 
 ## Notes / limitations
 

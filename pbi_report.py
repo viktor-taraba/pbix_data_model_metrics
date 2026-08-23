@@ -21,6 +21,7 @@ import pandas as pd
 try:
     from rich.console import Console
     from rich.table import Table
+    from rich.panel import Panel
     from rich import box
 
     RICH_AVAILABLE = True
@@ -97,6 +98,98 @@ def _cardinality_style(cardinality) -> str:
 
 def _sized_cell(value) -> "tuple[str, str]":
     return human_bytes(value), _size_style(value)
+
+
+def _format_last_refresh(ts) -> str:
+    if ts is None or (isinstance(ts, float) and pd.isna(ts)):
+        return "unknown"
+    try:
+        ts = pd.Timestamp(ts)
+        if pd.isna(ts):
+            return "unknown"
+        return ts.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(ts)
+
+
+def print_model_summary(summary: dict, title: str = "MODEL SUMMARY") -> None:
+    """Section 0 of the report: total in-memory size, last data refresh,
+    and table/column counts - the "how big is this thing and how fresh is
+    it" glance before diving into any per-table/per-column detail."""
+    total_size_txt = human_bytes(summary.get("TotalSize"))
+    refresh_txt = _format_last_refresh(summary.get("LastDataRefresh"))
+    num_tables = summary.get("NumTables", "-")
+    num_columns = summary.get("NumColumns", "-")
+
+    if not RICH_AVAILABLE:
+        print(f"\n=== {title} ===")
+        print(f"Total model size (in memory): {total_size_txt}")
+        print(f"Last data refresh:            {refresh_txt}")
+        print(f"Tables:                        {num_tables}")
+        print(f"Columns:                       {num_columns}")
+        return
+
+    size_style = _size_style(summary.get("TotalSize"))
+    body = (
+        f"[bold]Total model size (in memory):[/bold] [{size_style}]{total_size_txt}[/{size_style}]\n"
+        f"[bold]Last data refresh:[/bold] {refresh_txt}\n"
+        f"[bold]Tables:[/bold] {num_tables}    [bold]Columns:[/bold] {num_columns}"
+    )
+    panel = Panel(body, title=title, border_style="bold", box=box.ROUNDED, expand=False)
+    _console.print()
+    _console.print(panel)
+
+
+def print_table_size_distribution(
+    table_summary: pd.DataFrame,
+    title: str = "SIZE DISTRIBUTION BY TABLE",
+    bar_width: int = 30,
+) -> None:
+    """A simple horizontal bar chart of each table's TotalSize, with row
+    count and column count as data labels alongside the size - a quick
+    visual read of where the model's bulk actually lives, before the
+    detailed per-column sections below. `table_summary` is assumed already
+    sorted biggest-first (get_table_summary()'s own default)."""
+    if table_summary.empty:
+        return
+
+    max_size = float(table_summary["TotalSize"].max()) or 1.0
+
+    if not RICH_AVAILABLE:
+        print(f"\n=== {title} ===")
+        for _, row in table_summary.iterrows():
+            filled = int(round(float(row["TotalSize"]) / max_size * bar_width))
+            bar = ("#" * filled).ljust(bar_width)
+            print(
+                f"{str(row['Table'])[:22]:<22} {bar} "
+                f"{human_bytes(row['TotalSize']):>10}  "
+                f"({int(row['Rows']):,} rows, {int(row['ColumnCount'])} cols)"
+            )
+        return
+
+    t = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold")
+    t.add_column("Table", style="bold")
+    t.add_column("Size Distribution", no_wrap=True)
+    t.add_column("Total Size", justify="right")
+    t.add_column("Rows", justify="right")
+    t.add_column("Columns", justify="right")
+
+    for _, row in table_summary.iterrows():
+        filled = int(round(float(row["TotalSize"]) / max_size * bar_width))
+        filled = max(0, min(bar_width, filled))
+        bar_style = _size_style(row["TotalSize"])
+        bar = f"[{bar_style}]{'█' * filled}[/{bar_style}][dim]{'░' * (bar_width - filled)}[/dim]"
+        total_txt, total_style = _sized_cell(row["TotalSize"])
+        t.add_row(
+            str(row["Table"]),
+            bar,
+            f"[{total_style}]{total_txt}[/{total_style}]",
+            f"{int(row['Rows']):,}",
+            str(int(row["ColumnCount"])),
+        )
+
+    _console.print()
+    _console.print(t)
 
 
 def print_table_summary(table_summary: pd.DataFrame, title: str = "TABLE SUMMARY") -> None:

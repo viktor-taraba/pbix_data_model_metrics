@@ -31,6 +31,7 @@ from pbi_connection import PbiConnection
 from vertipaq_metrics import (
     get_column_metrics,
     get_table_summary,
+    get_model_summary,
     order_by_table_size_then_field_size,
 )
 import pbi_report
@@ -86,6 +87,9 @@ def main():
             cardinality_warnings=cardinality_warnings,
         )
         table_summary = get_table_summary(col_metrics)
+        # Fetched inside the `with` block since it needs another DMV round
+        # trip on the still-open connection.
+        model_summary = get_model_summary(conn, col_metrics, table_summary)
 
     if cardinality_warnings:
         n_failed = len(cardinality_warnings)
@@ -105,7 +109,12 @@ def main():
             file=sys.stderr,
         )
 
-    # ---- console output (four sections) ----
+    # ---- console output (five sections) ----
+
+    # 0. Whole-model summary: total in-memory size, last data refresh,
+    # table/column counts, and a size-by-table distribution visual.
+    pbi_report.print_model_summary(model_summary)
+    pbi_report.print_table_size_distribution(table_summary)
 
     # 1. Per-table rollup.
     pbi_report.print_table_summary(table_summary, title="TABLE SUMMARY")
@@ -133,6 +142,13 @@ def main():
     if args.export:
         if args.export.lower().endswith(".xlsx"):
             with pd.ExcelWriter(args.export) as writer:
+                overview = pd.DataFrame([{
+                    "Total Model Size (bytes)": model_summary["TotalSize"],
+                    "Last Data Refresh": model_summary["LastDataRefresh"],
+                    "Tables": model_summary["NumTables"],
+                    "Columns": model_summary["NumColumns"],
+                }])
+                overview.to_excel(writer, sheet_name="Overview", index=False)
                 table_summary.to_excel(writer, sheet_name="Tables", index=False)
                 col_metrics.to_excel(writer, sheet_name="Columns", index=False)
                 all_by_size.to_excel(writer, sheet_name="AllColumnsBySize", index=False)
