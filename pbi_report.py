@@ -113,9 +113,16 @@ def _format_last_refresh(ts) -> str:
 
 
 def print_model_summary(summary: dict, title: str = "MODEL SUMMARY") -> None:
-    """Section 0 of the report: total in-memory size, last data refresh,
-    and table/column counts - the "how big is this thing and how fresh is
-    it" glance before diving into any per-table/per-column detail."""
+    """Section 0 of the report: pbix file name/size, total in-memory
+    size, last data refresh, and table/column counts - the "what is this
+    file and how big/fresh is it" glance before diving into any
+    per-table/per-column detail."""
+    pbix_name = summary.get("PbixName") or "unknown (unsaved report, or file couldn't be located)"
+    pbix_size_txt = (
+        human_bytes(summary.get("PbixSizeBytes"))
+        if summary.get("PbixSizeBytes") is not None
+        else "-"
+    )
     total_size_txt = human_bytes(summary.get("TotalSize"))
     refresh_txt = _format_last_refresh(summary.get("LastDataRefresh"))
     num_tables = summary.get("NumTables", "-")
@@ -123,14 +130,18 @@ def print_model_summary(summary: dict, title: str = "MODEL SUMMARY") -> None:
 
     if not RICH_AVAILABLE:
         print(f"\n=== {title} ===")
-        print(f"Total model size (in memory): {total_size_txt}")
-        print(f"Last data refresh:            {refresh_txt}")
+        print(f"PBIX file:                     {pbix_name}  ({pbix_size_txt})")
+        print(f"Total model size (in memory):  {total_size_txt}")
+        print(f"Last data refresh:             {refresh_txt}")
         print(f"Tables:                        {num_tables}")
         print(f"Columns:                       {num_columns}")
         return
 
     size_style = _size_style(summary.get("TotalSize"))
+    pbix_size_style = _size_style(summary.get("PbixSizeBytes"))
     body = (
+        f"[bold]PBIX file:[/bold] {pbix_name}  "
+        f"([{pbix_size_style}]{pbix_size_txt}[/{pbix_size_style}] on disk)\n"
         f"[bold]Total model size (in memory):[/bold] [{size_style}]{total_size_txt}[/{size_style}]\n"
         f"[bold]Last data refresh:[/bold] {refresh_txt}\n"
         f"[bold]Tables:[/bold] {num_tables}    [bold]Columns:[/bold] {num_columns}"
