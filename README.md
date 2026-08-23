@@ -26,6 +26,9 @@ than ADOMD.NET / AMO (the same client libraries DAX Studio itself uses).
      (for the engine's internal "H$" pseudo-tables) hierarchy size
    - plus one `EVALUATE ROW(..., DISTINCTCOUNT(...))` DAX query per table
      to get **exact** cardinality (DMVs alone don't expose this reliably)
+4. **Reporting** (`pbi_report.py`) - renders the metrics to the console
+   as colorized tables via `rich` (falls back to plain text if `rich`
+   isn't installed or `--no-color` is passed).
 
 ## Setup
 
@@ -38,8 +41,9 @@ uv sync
 ```
 
 This creates/updates a local `.venv` with the exact locked versions of
-`pandas`, `openpyxl`, `psutil`, `python-dotenv`, and `pythonnet`. Run
-project scripts through `uv run` so they pick up that environment
+`pandas`, `openpyxl`, `psutil`, `python-dotenv`, `pythonnet`, and `rich`
+(used for the colorized console output - see "Console output" below).
+Run project scripts through `uv run` so they pick up that environment
 automatically, e.g.:
 
 ```bash
@@ -48,7 +52,8 @@ uv run python analyze_pbix.py
 
 (If you add or bump a dependency, edit `pyproject.toml`'s
 `dependencies` list and run `uv lock` to refresh `uv.lock`, then
-`uv sync` again — don't hand-edit `uv.lock`.)
+`uv sync` again — don't hand-edit `uv.lock`. This was just done to add
+`rich`, so `uv sync` needs to be re-run once after pulling that change.)
 
 You also need the ADOMD.NET client DLL. If Power BI Desktop is
 installed normally, it's already on your machine and the script finds
@@ -92,11 +97,29 @@ uv run python analyze_pbix.py --port 54321          # skip discovery, connect di
 uv run python analyze_pbix.py --no-cardinality      # faster, skips the DISTINCTCOUNT pass
 uv run python analyze_pbix.py --export metrics.csv
 uv run python analyze_pbix.py --export metrics.xlsx --top 50   # show/print more columns in the console top-N section
+uv run python analyze_pbix.py --no-color            # plain text output, no colors
 ```
 
 ### Console output
 
-Each run prints three sections:
+Console output is colorized via [`rich`](https://github.com/Textualize/rich)
+(`pbi_report.py`) - similar in spirit to a custom colored logger: bigger,
+heavier columns/tables are shown in warmer colors, encodings are
+color-coded, and columns whose cardinality is a large fraction of their
+table's row count (i.e. "expensive", hard-to-compress columns) are
+flagged. If `rich` isn't installed, or if you pass `--no-color`, every
+section below still prints - just as plain, uncolored text.
+
+Color legend:
+
+| What | Meaning |
+|---|---|
+| Size cells (Data/Dictionary/Hierarchy/Total) | bold red ≥ 1 MB, yellow ≥ 200 KB, green ≥ 20 KB, dim below that |
+| `% of DB` (table summary) | bold red ≥ 25%, yellow ≥ 10%, green ≥ 1%, dim below that |
+| `Encoding` | `VALUE` = bold green, `HASH` = cyan, `UNKNOWN` = bold red |
+| `Cardinality` | white ≤ 100k, yellow 100k–1M, red > 1M, dark red > 2M |
+
+Each run prints four sections:
 
 1. **TABLE SUMMARY** — one row per table, rolled up from the column
    metrics (row count, total data/dictionary/hierarchy/total size,
@@ -110,11 +133,18 @@ Each run prints three sections:
    this mirrors DAX Studio's own VertiPaq Analyzer "Columns" tab, which
    also lists the whole model flat and sorted by size rather than
    nested under each table.
+4. **ALL TABLES & COLUMNS (grouped by Table, biggest table first)** —
+   the opposite grouping from #3: tables are grouped together and
+   ordered biggest-table-first (by the table's own Total Size), and
+   *within* each table its fields are ordered by their own Total Size,
+   largest first. Useful when you want to review a model table-by-table
+   rather than as one flat, cross-table list.
 
-When exporting to `.xlsx`, the same three views are written out as
-separate sheets: `Tables`, `Columns` (per-table order, matching the
-column metrics' natural sort), and `AllColumnsBySize` (the flat,
-size-sorted view described above).
+When exporting to `.xlsx`, all four views are written out as separate
+sheets: `Tables`, `Columns` (per-table natural order matching the
+column metrics' own sort), `AllColumnsBySize` (section 3, flat and
+size-sorted), and `ByTableThenField` (section 4, grouped/ordered as
+above).
 
 ## Notes / limitations
 
@@ -139,3 +169,9 @@ size-sorted view described above).
   columns as measures in a single row), which is quick for most models.
   Very wide fact tables with dozens of high-cardinality columns will
   take longer — use `--no-cardinality` if you just want size metrics.
+- If the `Cardinality` column comes back entirely blank (`-` for every
+  column), that's no longer silent: the tool prints a
+  `[!] Cardinality could not be determined for N of M columns` summary
+  to stderr with the actual underlying error for each failure. Read
+  that message - it'll point at the real cause (a genuine DAX error,
+  a permissions/role issue, etc.) rather than you having to guess.
