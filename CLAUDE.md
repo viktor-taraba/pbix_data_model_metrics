@@ -44,7 +44,7 @@ This project uses **uv**, not raw `pip`. Source of truth is
 |---|---|
 | `pbi_discover.py` | Finds running `msmdsrv.exe` processes launched by Power BI Desktop, reads `msmdsrv.port.txt` from the per-file workspace folder under `%LOCALAPPDATA%\Microsoft\Power BI Desktop\AnalysisServicesWorkspaces\` to get the TCP port. Falls back to scanning that folder directly if process introspection fails (e.g. permissions). |
 | `pbi_connection.py` | Thin ADOMD.NET wrapper via `pythonnet` (`clr.AddReference`). Locates `Microsoft.AnalysisServices.AdomdClient.dll` (bundled with Power BI Desktop, or the standalone AMO/ADOMD.NET redistributable), opens a connection, auto-detects the catalog/database name via `$SYSTEM.DBSCHEMA_CATALOGS` if not given. Exposes `query_dmv()` and `query_dax()`, both returning `pandas.DataFrame`. |
-| `vertipaq_metrics.py` | The actual analyzer logic. Pulls `DISCOVER_STORAGE_TABLES`, `DISCOVER_STORAGE_TABLE_COLUMNS`, `DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS` DMVs and joins them in pandas (DMV SQL doesn't support real joins). Runs one `EVALUATE ROW(..., DISTINCTCOUNT(...))` DAX query per table for exact cardinality. Returns tidy per-column and per-table DataFrames, plus `order_by_table_size_then_field_size()` for the table-grouped ordering used in console section 4 / export sheet `ByTableThenField`. |
+| `vertipaq_metrics.py` | The actual analyzer logic. Pulls `DISCOVER_STORAGE_TABLES`, `DISCOVER_STORAGE_TABLE_COLUMNS`, `DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS` DMVs and joins them in pandas (DMV SQL doesn't support real joins). Runs one `EVALUATE ROW(..., DISTINCTCOUNT(...))` DAX query per table for exact cardinality. Returns tidy per-column and per-table DataFrames, plus `order_by_table_size_then_field_size()` for the table-grouped ordering used in console section 4 / export sheet `ByTableThenField`, and `get_model_summary()` for the whole-model stats (total size, last data refresh via `$SYSTEM.MDSCHEMA_CUBES`, table/column counts) used in console section 0. |
 | `pbi_report.py` | Colorized console rendering via `rich` (`print_table_summary`, `print_columns_table`, `print_grouped_by_table`). Every function degrades to plain `to_string()` output if `rich` isn't installed (checked via `pbi_report.RICH_AVAILABLE`) - keep that fallback working when touching this file, since `rich` is a real but non-critical dependency. |
 | `analyze_pbix.py` | CLI entry point. Auto-discovers/prompts for a running instance, prints the four console sections via `pbi_report`, optional `--export metrics.xlsx`/`.csv`, `--no-color` to force plain text. |
 | `README.md` | End-user setup + usage instructions. |
@@ -121,22 +121,62 @@ This project uses **uv**, not raw `pip`. Source of truth is
 - DMV query syntax is DMX-based SQL and does **not** support `JOIN`,
   `GROUP BY`, `LIKE`, `CAST`/`CONVERT` — all correlation across DMVs
   happens in pandas, not in the DMV query text.
-- **CLI console output** (`analyze_pbix.py` + `pbi_report.py`) has four
-  sections, in order: `TABLE SUMMARY` (per-table rollup), `TOP {--top}
-  COLUMNS BY TOTAL SIZE` (capped, for a quick glance), `ALL TABLES &
-  COLUMNS (sorted by Total Size, then Cardinality)` (the *full*,
-  uncapped column list, sorted flat across the whole model rather than
-  grouped per table - mirrors DAX Studio's own VertiPaq Analyzer
-  "Columns" tab), and `ALL TABLES & COLUMNS (grouped by Table, biggest
-  table first)` (tables grouped and ordered by each table's own Total
-  Size descending, fields within a table ordered by their own Total
-  Size descending - built by
+- **CLI console output** (`analyze_pbix.py` + `pbi_report.py`) has five
+  sections, in order: section 0, `MODEL SUMMARY` (total in-memory
+  size, last data refresh, table/column counts) followed immediately by
+  `SIZE DISTRIBUTION BY TABLE` (a horizontal bar chart, biggest table
+  first, row/column counts as data labels) - then `TABLE SUMMARY`
+  (per-table rollup), `TOP {--top} COLUMNS BY TOTAL SIZE` (capped, for
+  a quick glance), `ALL TABLES & COLUMNS (sorted by Total Size, then
+  Cardinality)` (the *full*, uncapped column list, sorted flat across
+  the whole model rather than grouped per table - mirrors DAX Studio's
+  own VertiPaq Analyzer "Columns" tab), and `ALL TABLES & COLUMNS
+  (grouped by Table, biggest table first)` (tables grouped and ordered
+  by each table's own Total Size descending, fields within a table
+  ordered by their own Total Size descending - built by
   `vertipaq_metrics.order_by_table_size_then_field_size()`).
-  `--export .xlsx` mirrors this with four sheets: `Tables`, `Columns`
-  (natural per-table order), `AllColumnsBySize` (section 3),
-  `ByTableThenField` (section 4). If you change the sort/columns of
-  one, keep the export sheet and the console section consistent with
-  each other.
+  `--export .xlsx` mirrors this with five sheets: `Overview` (the
+  model-summary numbers), `Tables`, `Columns` (natural per-table
+  order), `AllColumnsBySize`, `ByTableThenField`. If you change the
+  sort/columns of one, keep the export sheet and the console section
+  consistent with each other.
+- **"Total model size"** in the section-0 summary is `column_metrics
+  ["TotalSize"].sum()` - i.e. the same number DAX Studio's VertiPaq
+  Analyzer would show as the grand total across every table's "Total
+  Size" column. It does *not* include relationship-segment (`R$`)
+  overhead or other non-column engine memory, so treat it as a close
+  lower bound, not an exact process memory figure - see
+  `get_model_summary()`'s docstring.
+- **"Last data refresh"** is looked up two ways, in order, via
+  `_get_last_data_refresh()` / the shared `_timestamps_from_dmv()`
+  helper:
+  1. `$SYSTEM.MDSCHEMA_CUBES`'s `LAST_DATA_UPDATE`.
+  2. `$SYSTEM.TMSCHEMA_TABLES`'s `ModifiedTime` (max across all tables)
+     as a fallback.
+  **This fallback is not optional/cosmetic - it's the common case.**
+  `LAST_DATA_UPDATE` is traditional multidimensional-cube metadata; on
+  Tabular models (i.e. every Power BI Desktop model) the column is
+  frequently present-but-null for every row, so the query succeeds
+  with no exception and (1) silently yields nothing. `ModifiedTime` in
+  `TMSCHEMA_TABLES` is the field DAX Studio's own VertiPaq Analyzer
+  actually surfaces as "Last Data Refresh" - deliberately not its
+  sibling `StructureModifiedTime`, which tracks schema/structure edits
+  (e.g. renaming a column) rather than data refreshes and would
+  overstate freshness if used here. Verified against a real DAX
+  Studio side-by-side comparison during development: DAX Studio showed
+  `29.11.2022 1:33:48 +02:00`; this tool's fallback path (1) returning
+  nothing then (2) resolving via `TMSCHEMA_TABLES` reproduced the same
+  `2022-11-29 01:33:48` (naive, no offset - see below). If you add a
+  third fallback source, keep it behind `_timestamps_from_dmv()` so it
+  gets the same quiet must-actually-have-a-non-null-value treatment as
+  the first two, rather than a bespoke try/except.
+  **Timezone note:** the value returned is naive (no UTC offset) -
+  ADOMD.NET/pythonnet hands back the underlying .NET `DateTime` as-is,
+  which doesn't carry timezone info the way DAX Studio's UI-level
+  `+02:00`/`+03:00` display does. Don't assume it's UTC or local
+  without checking against the specific engine/session - if exact
+  offset handling matters for a future change, that needs its own
+  investigation rather than a guessed `tz_localize()`.
 - **Colors** are handled entirely in `pbi_report.py` via `rich`; there's
   a plain-text fallback path (`RICH_AVAILABLE = False`) exercised both
   when `rich` isn't installed and when the user passes `--no-color`

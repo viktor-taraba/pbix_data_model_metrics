@@ -384,6 +384,75 @@ def get_table_summary(column_metrics: pd.DataFrame) -> pd.DataFrame:
     return summary.sort_values("TotalSize", ascending=False).reset_index()
 
 
+def _timestamps_from_dmv(conn: PbiConnection, dmv_sql: str, column: str):
+    """Run a DMV query and return the max non-null timestamp in `column`,
+    or None if the query failed, returned nothing, lacked the column, or
+    every value in it was null. A helper shared by the two refresh-lookup
+    strategies below, since both need identical "be quiet and try the next
+    thing" handling."""
+    try:
+        df = conn.query_dmv(dmv_sql)
+    except Exception:
+        return None
+    if df is None or df.empty or column not in df.columns:
+        return None
+    timestamps = pd.to_datetime(df[column], errors="coerce").dropna()
+    if timestamps.empty:
+        return None
+    return timestamps.max()
+
+
+def _get_last_data_refresh(conn: PbiConnection):
+    """Best-effort lookup of the model's last data-refresh timestamp.
+
+    Tries two documented rowsets, in order:
+
+    1. $SYSTEM.MDSCHEMA_CUBES's LAST_DATA_UPDATE - the traditional
+       multidimensional-cube metadata field. For Tabular models (what
+       Power BI Desktop actually runs), this is frequently present as a
+       column but *null* for every row - the query succeeds, so no
+       exception is raised, but there's nothing usable in it.
+    2. $SYSTEM.TMSCHEMA_TABLES's ModifiedTime - Tabular's own internal
+       metadata rowset, with one row per table. This is what DAX
+       Studio's own VertiPaq Analyzer "Last Data Refresh" figure is
+       actually built from: ModifiedTime tracks when each table's data
+       was last processed/refreshed. (Its sibling column,
+       StructureModifiedTime, tracks schema/structure changes instead -
+       e.g. renaming a column without touching the data - so it is
+       deliberately NOT used here; that would overstate how "fresh" the
+       data itself is.) The max ModifiedTime across all tables is the
+       model's overall last data refresh.
+
+    Returns a pandas.Timestamp, or None if neither rowset yielded one
+    (older engine versions, a locked-down role, or a model that's never
+    been refreshed)."""
+    ts = _timestamps_from_dmv(conn, "SELECT * FROM $SYSTEM.MDSCHEMA_CUBES", "LAST_DATA_UPDATE")
+    if ts is not None:
+        return ts
+    return _timestamps_from_dmv(conn, "SELECT * FROM $SYSTEM.TMSCHEMA_TABLES", "ModifiedTime")
+
+
+def get_model_summary(
+    conn: PbiConnection, column_metrics: pd.DataFrame, table_summary: pd.DataFrame
+) -> dict:
+    """High-level, whole-model stats for the report's summary section:
+    total in-memory size, last data refresh, table count, column count.
+
+    "Total model size" here is the sum of every column's TotalSize (Data +
+    Dictionary + Hierarchy) - i.e. the same number you'd get by summing the
+    'Total Size' column across every table in DAX Studio's VertiPaq
+    Analyzer. It does not include relationship-segment ("R$") or other
+    non-column engine overhead, so it's a close lower bound on the model's
+    real total memory footprint, not an exact one.
+    """
+    return {
+        "TotalSize": int(column_metrics["TotalSize"].sum()),
+        "NumTables": int(table_summary["Table"].nunique()),
+        "NumColumns": int(len(column_metrics)),
+        "LastDataRefresh": _get_last_data_refresh(conn),
+    }
+
+
 def order_by_table_size_then_field_size(
     column_metrics: pd.DataFrame, table_summary: pd.DataFrame | None = None
 ) -> pd.DataFrame:
