@@ -110,7 +110,21 @@ def _quote_column(name: str) -> str:
     return str(name).replace("]", "]]")
 
 
-def _get_cardinalities(conn: PbiConnection, table_column_pairs) -> dict[tuple[str, str], int]:
+def _normalize_alias(name: str) -> str:
+    """Normalize a result-set column name for matching against our own
+    "C0", "C1", ... aliases. Different ADOMD.NET / engine versions have been
+    observed to come back with the alias wrapped in brackets (e.g. "[C0]")
+    or with incidental whitespace, rather than the plain "C0" you'd expect
+    from EVALUATE ROW("C0", ...). Matching only the exact, unwrapped string
+    (as a plain `in row.index` check) silently matches *nothing* in that
+    case - with no exception raised - which looks identical to "every
+    column's cardinality is unavailable" and gives no clue why."""
+    return str(name).strip().strip("[]").strip().upper()
+
+
+def _get_cardinalities(
+    conn: PbiConnection, table_column_pairs, warnings_out: list[str] | None = None
+) -> dict[tuple[str, str], int]:
     """Run one DAX query per table, returning DISTINCTCOUNT() for every one
     of its columns in a single row, so we don't need N queries for N columns.
 
@@ -119,7 +133,16 @@ def _get_cardinalities(conn: PbiConnection, table_column_pairs) -> dict[tuple[st
     taken straight from DISCOVER_STORAGE_TABLE_COLUMNS), not re-derived from
     a different metadata DMV, so that the dict keys line up exactly with the
     rest of the report without relying on name-matching across two DMVs.
+
+    warnings_out: if given, human-readable diagnostic strings are appended
+    here whenever a column's cardinality couldn't be determined, instead of
+    being silently swallowed. Always check this after calling - a fully
+    empty/blank Cardinality column with no entries here would be surprising
+    and worth re-reading this docstring's mismatch note above.
     """
+    if warnings_out is None:
+        warnings_out = []
+
     cardinalities: dict[tuple[str, str], int] = {}
 
     by_table: dict[str, list[str]] = {}
@@ -138,29 +161,61 @@ def _get_cardinalities(conn: PbiConnection, table_column_pairs) -> dict[tuple[st
         ]
 
         dax = "EVALUATE ROW(" + ", ".join(measures) + ")"
+        batch_error: Exception | None = None
         try:
             result = conn.query_dax(dax)
             if result is not None and not result.empty:
                 row0 = result.iloc[0]
+                # Tolerant lookup: match aliases even if the engine returned
+                # them bracket-wrapped, differently-cased, or padded (see
+                # _normalize_alias). Build this once per table.
+                normalized_index = {_normalize_alias(c): c for c in row0.index}
                 for alias, col_name in alias_map.items():
-                    if alias in row0.index:
-                        val = row0[alias]
+                    actual_col = normalized_index.get(_normalize_alias(alias))
+                    if actual_col is not None:
+                        val = row0[actual_col]
                         cardinalities[(table_name, col_name)] = None if pd.isna(val) else int(val)
-        except Exception:
-            # A single unqueryable column (e.g. an unusual data type) would
-            # otherwise blank out the whole table - fall back to querying
-            # this table's columns one at a time.
-            for col_name in col_names:
-                single_dax = (
-                    f'EVALUATE ROW("C", '
-                    f"DISTINCTCOUNT('{safe_table}'[{_quote_column(col_name)}]))"
+            else:
+                batch_error = RuntimeError("query returned no rows")
+        except Exception as exc:  # noqa: BLE001 - deliberately broad, see fallback below
+            batch_error = exc
+
+        # Anything not resolved by the batch query above - whether because
+        # the whole query raised, or because it silently returned but some
+        # (or all) aliases didn't match anything in the result - gets a
+        # per-column retry. A *mismatch* is just as much a failure as an
+        # exception and must not be ignored the way it previously was.
+        missing = [c for c in col_names if (table_name, c) not in cardinalities]
+        for col_name in missing:
+            single_dax = (
+                f'EVALUATE ROW("C", '
+                f"DISTINCTCOUNT('{safe_table}'[{_quote_column(col_name)}]))"
+            )
+            try:
+                r = conn.query_dax(single_dax)
+                if r is None or r.empty:
+                    raise RuntimeError("query returned no rows")
+                normalized_index = {_normalize_alias(c): c for c in r.columns}
+                actual_col = normalized_index.get(_normalize_alias("C"), r.columns[0])
+                val = r.iloc[0][actual_col]
+                cardinalities[(table_name, col_name)] = None if pd.isna(val) else int(val)
+            except Exception as exc:  # noqa: BLE001
+                cardinalities[(table_name, col_name)] = None
+                warnings_out.append(
+                    f"{table_name}[{col_name}]: cardinality query failed - "
+                    f"{type(exc).__name__}: {exc}"
                 )
-                try:
-                    r = conn.query_dax(single_dax)
-                    val = r.iloc[0, 0]
-                    cardinalities[(table_name, col_name)] = None if pd.isna(val) else int(val)
-                except Exception:
-                    cardinalities[(table_name, col_name)] = None
+
+        if batch_error is not None and missing:
+            # Surface the batch-level failure too (once per table), even
+            # though the per-column retries above already logged their own
+            # errors - the batch error is often the more informative one
+            # (e.g. it'll show a DAX syntax/name-resolution error that a
+            # single-column query for an unrelated column won't reproduce).
+            warnings_out.append(
+                f"{table_name}: batch cardinality query failed - "
+                f"{type(batch_error).__name__}: {batch_error}"
+            )
 
     return cardinalities
 
@@ -179,7 +234,11 @@ def _get_hierarchy_sizes_by_name(storage_columns: pd.DataFrame, segments: pd.Dat
         storage_columns["TABLE_ID"].astype(str).str.startswith("H$")
     ].copy()
     if hier_columns.empty:
-        return pd.Series(dtype="int64", name="HierarchySize")
+        return pd.Series(
+            dtype="int64",
+            index=pd.MultiIndex.from_tuples([], names=["DIMENSION_NAME", "ATTRIBUTE_NAME"]),
+            name="HierarchySize",
+        )
 
     hier_columns["TABLE_ID"] = hier_columns["TABLE_ID"].astype(str)
     hier_columns["COLUMN_ID"] = hier_columns["COLUMN_ID"].astype(str)
@@ -210,9 +269,19 @@ def _get_hierarchy_sizes_by_name(storage_columns: pd.DataFrame, segments: pd.Dat
     )
 
 
-def get_column_metrics(conn: PbiConnection, include_cardinality: bool = True) -> pd.DataFrame:
+def get_column_metrics(
+    conn: PbiConnection,
+    include_cardinality: bool = True,
+    cardinality_warnings: list[str] | None = None,
+) -> pd.DataFrame:
     """Main entry point: returns a tidy DataFrame, one row per column,
-    with Data/Dictionary/Hierarchy/Total size in bytes plus cardinality."""
+    with Data/Dictionary/Hierarchy/Total size in bytes plus cardinality.
+
+    cardinality_warnings: if given (e.g. an empty list you hold onto), it
+    gets filled in-place with one diagnostic string per column whose
+    cardinality couldn't be determined. Pass this in and check it whenever
+    the Cardinality column comes back unexpectedly blank - previously those
+    failures were swallowed with zero indication of what went wrong."""
 
     storage_tables = _get_storage_tables(conn)
     storage_columns = _get_storage_columns(conn)
@@ -286,7 +355,9 @@ def get_column_metrics(conn: PbiConnection, include_cardinality: bool = True) ->
         # Use base's own (Table, Column) names directly - these are exactly
         # what the rest of the report uses, so the dict keys are guaranteed
         # to match (no risk of mismatched display names across DMVs).
-        cardinalities = _get_cardinalities(conn, zip(base["Table"], base["Column"]))
+        cardinalities = _get_cardinalities(
+            conn, zip(base["Table"], base["Column"]), warnings_out=cardinality_warnings
+        )
         base["Cardinality"] = [
             cardinalities.get((t, c)) for t, c in zip(base["Table"], base["Column"])
         ]
@@ -311,3 +382,31 @@ def get_table_summary(column_metrics: pd.DataFrame) -> pd.DataFrame:
     summary = column_metrics.groupby("Table").agg(agg).rename(columns={"Column": "ColumnCount"})
     summary["% of DB"] = (summary["TotalSize"] / summary["TotalSize"].sum() * 100).round(2)
     return summary.sort_values("TotalSize", ascending=False).reset_index()
+
+
+def order_by_table_size_then_field_size(
+    column_metrics: pd.DataFrame, table_summary: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """Return column_metrics reordered so that:
+      1. Tables are grouped together, biggest table (by total TotalSize)
+         first.
+      2. Within each table, fields are ordered by their own TotalSize,
+         largest first.
+
+    This differs from get_column_metrics()'s own default ordering, which
+    sorts tables alphabetically and only orders fields by size *within*
+    that alphabetical grouping.
+    """
+    if table_summary is None:
+        table_summary = get_table_summary(column_metrics)
+
+    table_order = table_summary.sort_values("TotalSize", ascending=False)["Table"].tolist()
+
+    ordered = column_metrics.copy()
+    # A pandas Categorical whose category order is table_order lets us sort
+    # by table "rank" (biggest table's rows first) instead of alphabetically,
+    # while still sorting each table's own rows by field TotalSize.
+    ordered["Table"] = pd.Categorical(ordered["Table"], categories=table_order, ordered=True)
+    ordered = ordered.sort_values(["Table", "TotalSize"], ascending=[True, False])
+    ordered["Table"] = ordered["Table"].astype(str)
+    return ordered.reset_index(drop=True)

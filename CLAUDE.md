@@ -44,8 +44,9 @@ This project uses **uv**, not raw `pip`. Source of truth is
 |---|---|
 | `pbi_discover.py` | Finds running `msmdsrv.exe` processes launched by Power BI Desktop, reads `msmdsrv.port.txt` from the per-file workspace folder under `%LOCALAPPDATA%\Microsoft\Power BI Desktop\AnalysisServicesWorkspaces\` to get the TCP port. Falls back to scanning that folder directly if process introspection fails (e.g. permissions). |
 | `pbi_connection.py` | Thin ADOMD.NET wrapper via `pythonnet` (`clr.AddReference`). Locates `Microsoft.AnalysisServices.AdomdClient.dll` (bundled with Power BI Desktop, or the standalone AMO/ADOMD.NET redistributable), opens a connection, auto-detects the catalog/database name via `$SYSTEM.DBSCHEMA_CATALOGS` if not given. Exposes `query_dmv()` and `query_dax()`, both returning `pandas.DataFrame`. |
-| `vertipaq_metrics.py` | The actual analyzer logic. Pulls `DISCOVER_STORAGE_TABLES`, `DISCOVER_STORAGE_TABLE_COLUMNS`, `DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS` DMVs and joins them in pandas (DMV SQL doesn't support real joins). Runs one `EVALUATE ROW(..., DISTINCTCOUNT(...))` DAX query per table for exact cardinality. Returns tidy per-column and per-table DataFrames. |
-| `analyze_pbix.py` | CLI entry point. Auto-discovers/prompts for a running instance, prints console tables, optional `--export metrics.xlsx`/`.csv`. |
+| `vertipaq_metrics.py` | The actual analyzer logic. Pulls `DISCOVER_STORAGE_TABLES`, `DISCOVER_STORAGE_TABLE_COLUMNS`, `DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS` DMVs and joins them in pandas (DMV SQL doesn't support real joins). Runs one `EVALUATE ROW(..., DISTINCTCOUNT(...))` DAX query per table for exact cardinality. Returns tidy per-column and per-table DataFrames, plus `order_by_table_size_then_field_size()` for the table-grouped ordering used in console section 4 / export sheet `ByTableThenField`. |
+| `pbi_report.py` | Colorized console rendering via `rich` (`print_table_summary`, `print_columns_table`, `print_grouped_by_table`). Every function degrades to plain `to_string()` output if `rich` isn't installed (checked via `pbi_report.RICH_AVAILABLE`) - keep that fallback working when touching this file, since `rich` is a real but non-critical dependency. |
+| `analyze_pbix.py` | CLI entry point. Auto-discovers/prompts for a running instance, prints the four console sections via `pbi_report`, optional `--export metrics.xlsx`/`.csv`, `--no-color` to force plain text. |
 | `README.md` | End-user setup + usage instructions. |
 
 ## Key implementation facts (don't re-derive these from scratch)
@@ -100,19 +101,51 @@ This project uses **uv**, not raw `pip`. Source of truth is
   `TMSCHEMA_COLUMNS` — otherwise a display-name mismatch between two
   DMVs (or a type mismatch on a filter like `Type.isin([...])`) can
   silently zero out cardinality for the whole model with no error.
+  **Two failure modes were previously indistinguishable from "it just
+  worked" and silently produced an all-blank `Cardinality` column:**
+  (1) some ADOMD.NET/engine combinations return `EVALUATE ROW("C0",
+  ...)` result columns bracket-wrapped (`"[C0]"`) rather than plain
+  (`"C0"`), so a plain `alias in row0.index` check matches nothing,
+  with no exception raised; (2) the per-column fallback's bare
+  `except Exception: ... = None` swallowed the real error completely.
+  Both are fixed: alias matching is now tolerant (`_normalize_alias`
+  strips brackets/whitespace/case before comparing), a *mismatch* (not
+  just a raised exception) now also triggers the per-column fallback,
+  and every failure - batch or per-column - is appended as a
+  human-readable string to the optional `cardinality_warnings` list
+  passed into `get_column_metrics()`. `analyze_pbix.py` prints a
+  summary of these to stderr. If you ever see an all-blank
+  `Cardinality` column again, that warning list is where to look first
+  - don't just assume DISTINCTCOUNT failed for everything without
+  reading it.
 - DMV query syntax is DMX-based SQL and does **not** support `JOIN`,
   `GROUP BY`, `LIKE`, `CAST`/`CONVERT` — all correlation across DMVs
   happens in pandas, not in the DMV query text.
-- **CLI console output** (`analyze_pbix.py`) has three sections, in
-  order: `TABLE SUMMARY` (per-table rollup), `TOP {--top} COLUMNS BY
-  TOTAL SIZE` (capped, for a quick glance), and `ALL TABLES & COLUMNS
-  (sorted by Total Size, then Cardinality)` (the *full*, uncapped
-  column list, sorted flat across the whole model rather than grouped
-  per table — mirrors DAX Studio's own VertiPaq Analyzer "Columns" tab).
-  `--export .xlsx` mirrors this with three sheets: `Tables`, `Columns`
-  (natural per-table order), `AllColumnsBySize` (the flat sorted view).
-  If you change the sort/columns of one, keep the export sheet and the
-  console section consistent with each other.
+- **CLI console output** (`analyze_pbix.py` + `pbi_report.py`) has four
+  sections, in order: `TABLE SUMMARY` (per-table rollup), `TOP {--top}
+  COLUMNS BY TOTAL SIZE` (capped, for a quick glance), `ALL TABLES &
+  COLUMNS (sorted by Total Size, then Cardinality)` (the *full*,
+  uncapped column list, sorted flat across the whole model rather than
+  grouped per table - mirrors DAX Studio's own VertiPaq Analyzer
+  "Columns" tab), and `ALL TABLES & COLUMNS (grouped by Table, biggest
+  table first)` (tables grouped and ordered by each table's own Total
+  Size descending, fields within a table ordered by their own Total
+  Size descending - built by
+  `vertipaq_metrics.order_by_table_size_then_field_size()`).
+  `--export .xlsx` mirrors this with four sheets: `Tables`, `Columns`
+  (natural per-table order), `AllColumnsBySize` (section 3),
+  `ByTableThenField` (section 4). If you change the sort/columns of
+  one, keep the export sheet and the console section consistent with
+  each other.
+- **Colors** are handled entirely in `pbi_report.py` via `rich`; there's
+  a plain-text fallback path (`RICH_AVAILABLE = False`) exercised both
+  when `rich` isn't installed and when the user passes `--no-color`
+  (`analyze_pbix.py` flips `pbi_report.RICH_AVAILABLE` directly rather
+  than threading a flag through every call). Color thresholds (byte
+  size, `% of DB`, cardinality ratio) are small pure functions
+  (`_size_style`, `_pct_style`, `_cardinality_style`, `_encoding_style`)
+  - if you add a new colored metric, follow that pattern rather than
+  inlining `rich` markup into the row-building loops.
 
 ## If asked to extend this
 
