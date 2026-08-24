@@ -40,14 +40,14 @@ import pbi_report
 def choose_instance():
     instances = find_all()
     if not instances:
-        print("No running Power BI Desktop instances found.")
-        print("Open a .pbix file in Power BI Desktop and try again.")
+        pbi_report.print_status("No running Power BI Desktop instances found.")
+        pbi_report.print_status("Open a .pbix file in Power BI Desktop and try again.")
         sys.exit(1)
 
     if len(instances) == 1:
         return instances[0]
 
-    print("Multiple Power BI Desktop instances found:\n")
+    pbi_report.print_status("Multiple Power BI Desktop instances found:\n")
     for i, inst in enumerate(instances):
         print(f"  [{i}] {inst}")
     choice = input("\nPick an instance number: ").strip()
@@ -81,11 +81,11 @@ def main():
     else:
         inst = choose_instance()
         port = inst.port
-        print(f"\nConnecting to localhost:{port} ...")
+        pbi_report.print_status(f"\nConnecting to localhost:{port} ...")
 
     with PbiConnection(port=port, database=args.database, adomd_dll_path=args.adomd_dll) as conn:
-        print(f"Connected to database: {conn.database}\n")
-        print("Extracting storage metrics ...")
+        pbi_report.print_status(f"Connected to database: {conn.database}\n")
+        pbi_report.print_status("Extracting storage metrics ...")
         cardinality_warnings: list[str] = []
         col_metrics = get_column_metrics(
             conn,
@@ -108,55 +108,62 @@ def main():
     if cardinality_warnings:
         n_failed = len(cardinality_warnings)
         n_total = len(col_metrics)
-        print(
+        pbi_report.print_status(
             f"\n[!] Cardinality could not be determined for {n_failed} of "
             f"{n_total} columns. First few reasons:",
-            file=sys.stderr,
+            to_stderr=True,
         )
         for msg in cardinality_warnings[:10]:
-            print(f"    - {msg}", file=sys.stderr)
+            pbi_report.print_status(f"    - {msg}", to_stderr=True)
         if n_failed > 10:
-            print(f"    ... and {n_failed - 10} more.", file=sys.stderr)
-        print(
+            pbi_report.print_status(f"    ... and {n_failed - 10} more.", to_stderr=True)
+        pbi_report.print_status(
             "    (Those columns show '-' for Cardinality below instead of "
             "silently looking like every column succeeded.)\n",
-            file=sys.stderr,
+            to_stderr=True,
         )
 
     if refresh_diagnostics:
         if model_summary["LastDataRefresh"] is None:
-            print(
+            pbi_report.print_status(
                 "\n[!] Could not determine last data refresh. Reasons per source tried:",
-                file=sys.stderr,
+                to_stderr=True,
             )
             for msg in refresh_diagnostics:
-                print(f"    - {msg}", file=sys.stderr)
-            print(
+                pbi_report.print_status(f"    - {msg}", to_stderr=True)
+            pbi_report.print_status(
                 "    (Shows as 'unknown' in MODEL SUMMARY below instead of silently "
                 "picking a wrong date.)\n",
-                file=sys.stderr,
+                to_stderr=True,
             )
         elif any(msg.startswith("Used ") for msg in refresh_diagnostics):
             # This marker only appears when more than one source actually
             # returned a value (see _get_last_data_refresh) - a routine run
             # where only one source succeeds and the rest fail with an
-            # expected "column is null" reason doesn't trigger this, so
+            # expected "column is null" reason does not trigger this, so
             # this block only fires for a genuine, worth-knowing-about
             # disagreement between sources.
-            print(
+            pbi_report.print_status(
                 "\n[i] Last data refresh: sources disagreed, used the most recent:",
-                file=sys.stderr,
+                to_stderr=True,
             )
             for msg in refresh_diagnostics:
-                print(f"    - {msg}", file=sys.stderr)
-            print(file=sys.stderr)
+                pbi_report.print_status(f"    - {msg}", to_stderr=True)
+            pbi_report.print_status("", to_stderr=True)
 
-    # ---- console output (five sections) ----
+    # ---- console output (six sections) ----
 
     # 0. Whole-model summary: total in-memory size, last data refresh,
-    # table/column counts, and a size-by-table distribution visual.
+    # table/column counts, and a size-by-table distribution visual,
+    # followed immediately by the column-level equivalent: the top 10
+    # columns by Total Size with a cumulative % of the model's total
+    # size, so you can see at a glance how concentrated the model's bulk
+    # is in just a handful of columns.
     pbi_report.print_model_summary(model_summary)
     pbi_report.print_table_size_distribution(table_summary)
+    pbi_report.print_column_size_distribution(
+        col_metrics, total_model_size=model_summary["TotalSize"]
+    )
 
     # 1. Per-table rollup.
     pbi_report.print_table_summary(table_summary, title="TABLE SUMMARY")
@@ -199,7 +206,7 @@ def main():
                 by_table_then_field.to_excel(writer, sheet_name="ByTableThenField", index=False)
         else:
             col_metrics.to_csv(args.export, index=False)
-        print(f"\nExported full results to {args.export}")
+        pbi_report.print_status(f"\nExported full results to {args.export}")
 
 
 if __name__ == "__main__":

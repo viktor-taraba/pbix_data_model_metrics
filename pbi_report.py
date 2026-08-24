@@ -16,6 +16,8 @@ it's just monochrome.
 
 from __future__ import annotations
 
+import sys
+
 import pandas as pd
 
 try:
@@ -30,7 +32,50 @@ except ImportError:  # pragma: no cover - exercised via the fallback path
 
 _SIZE_COLUMNS = ["DataSize", "DictionarySize", "HierarchySize", "TotalSize"]
 
+# Style used for every top-level report SECTION HEADER (table titles, the
+# model-summary panel's title, and the "grouped by table" rule) - a solid
+# colored background so headers are unmistakably distinct from the data
+# rows/colors below them (red/yellow/green/dim are already "taken" for
+# size/percentage/cardinality scales, so headers deliberately use blue,
+# a color not otherwise used for data coloring anywhere in this module).
+_HEADER_STYLE = "bold white on grey23"
+
+# Style used for short one-line STATUS/PROGRESS messages printed by the
+# CLI (e.g. "Connecting to ...", "Extracting storage metrics ...", or a
+# "[!]"/"[i]" diagnostic note) via print_status() below - yellow, so the
+# tool's own running commentary is visually distinct from both the
+# colored section headers above and the report's data tables.
+_STATUS_STYLE = "yellow"
+
 _console: "Console | None" = Console() if RICH_AVAILABLE else None
+_err_console: "Console | None" = Console(stderr=True) if RICH_AVAILABLE else None
+
+
+def _header_markup(text: str) -> str:
+    """Wrap a section title in the shared header style as rich markup.
+
+    Table() has its own `title_style` constructor parameter, but Panel()
+    and Console.rule() don't - for those, the style has to be embedded
+    directly in the title text itself as markup, which is what this
+    produces."""
+    return f"[{_HEADER_STYLE}] {text} [/]"
+
+
+def print_status(message: str, to_stderr: bool = False) -> None:
+    """Print a short status/progress line - e.g. "Connecting to
+    localhost:...", "Extracting storage metrics ...", or a "[!]"/"[i]"
+    diagnostic note - styled yellow so it visually reads as "the tool
+    talking to you" rather than part of the report's own data tables.
+
+    Falls back to a plain, uncolored print() when `rich` isn't installed
+    or `--no-color` forced RICH_AVAILABLE off - there's no color
+    available in that mode, so this just prints the message unstyled.
+    """
+    if not RICH_AVAILABLE:
+        print(message, file=sys.stderr if to_stderr else None)
+        return
+    console = _err_console if to_stderr else _console
+    console.print(message, style=_STATUS_STYLE, highlight=False)
 
 
 def human_bytes(n) -> str:
@@ -59,15 +104,18 @@ def human_bytes(n) -> str:
 
 
 def _size_style(n_bytes) -> str:
-    """Color scale for an absolute byte count: heavier = warmer."""
+    """Color scale for an absolute byte count: heavier = warmer.
+
+    Thresholds: bold red >= 5 MB, yellow >= 3 MB, green >= 1 MB, dim
+    below that (and for NaN/missing)."""
     if pd.isna(n_bytes):
         return "dim"
     n_bytes = float(n_bytes)
-    if n_bytes >= 1024 * 1024:        # >= 1 MB
+    if n_bytes >= 5 * 1024 * 1024:    # >= 5 MB
         return "bold red"
-    if n_bytes >= 200 * 1024:         # >= 200 KB
+    if n_bytes >= 3 * 1024 * 1024:    # >= 3 MB
         return "yellow"
-    if n_bytes >= 20 * 1024:          # >= 20 KB
+    if n_bytes >= 1 * 1024 * 1024:    # >= 1 MB
         return "green"
     return "dim"
 
@@ -160,7 +208,7 @@ def print_model_summary(summary: dict, title: str = "MODEL SUMMARY") -> None:
         f"[bold]Last data refresh:[/bold] {refresh_txt}\n"
         f"[bold]Tables:[/bold] {num_tables}    [bold]Columns:[/bold] {num_columns}"
     )
-    panel = Panel(body, title=title, border_style="bold", box=box.ROUNDED, expand=False)
+    panel = Panel(body, title=_header_markup(title), border_style="bold", box=box.ROUNDED, expand=False)
     _console.print()
     _console.print(panel)
 
@@ -192,7 +240,7 @@ def print_table_size_distribution(
             )
         return
 
-    t = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold")
+    t = Table(title=title, title_style=_HEADER_STYLE, box=box.SIMPLE_HEAVY, header_style="bold")
     t.add_column("Table", style="bold")
     t.add_column("Size Distribution", no_wrap=True)
     t.add_column("Total Size", justify="right")
@@ -217,6 +265,98 @@ def print_table_size_distribution(
     _console.print(t)
 
 
+def print_column_size_distribution(
+    col_metrics: pd.DataFrame,
+    total_model_size: float | int | None = None,
+    title: str = "TOP 10 COLUMNS BY TOTAL SIZE",
+    top_n: int = 10,
+    bar_width: int = 30,
+) -> None:
+    """Column-level companion to print_table_size_distribution(): a
+    horizontal bar chart of the `top_n` (default 10) biggest columns in
+    the whole model by TotalSize, biggest first, alongside each column's
+    own % of the whole model's size AND the running cumulative % of the
+    model's total size accounted for once you include that column and
+    every column listed above it.
+
+    That cumulative figure is the point of this section: a single
+    column's own % of DB doesn't answer "how much of my model's bulk is
+    concentrated in a handful of columns" - the cumulative line does
+    (e.g. "the top 10 columns together account for 78% of this model").
+
+    `col_metrics` should be the FULL, un-truncated per-column metrics
+    DataFrame (this function does its own top-N selection/sorting) -
+    passing an already-truncated or already-sorted-differently frame will
+    silently produce a truncated/incorrect top-N and cumulative total.
+
+    total_model_size: the whole model's total size in bytes, i.e.
+    the same number shown in MODEL SUMMARY
+    (model_summary["TotalSize"] / column_metrics["TotalSize"].sum()
+    computed over the FULL model). Pass this explicitly - it's the
+    correct denominator for "% of DB" even if a caller ever passes a
+    filtered/partial `col_metrics` in for some other reason. Falls back
+    to summing the given `col_metrics` if omitted, which is only correct
+    when the full model's column metrics were passed in.
+    """
+    if col_metrics.empty:
+        return
+
+    top = col_metrics.sort_values("TotalSize", ascending=False).head(top_n).copy()
+    if top.empty:
+        return
+
+    if total_model_size is None:
+        total_model_size = float(col_metrics["TotalSize"].sum())
+    total_model_size = float(total_model_size) or 1.0
+
+    top["CumulativeSize"] = top["TotalSize"].cumsum()
+    top["CumulativePct"] = (top["CumulativeSize"] / total_model_size * 100).clip(upper=100.0)
+    top["PctOfDb"] = top["TotalSize"] / total_model_size * 100
+
+    max_size = float(top["TotalSize"].max()) or 1.0
+
+    if not RICH_AVAILABLE:
+        print(f"\n=== {title} ===")
+        for _, row in top.iterrows():
+            filled = int(round(float(row["TotalSize"]) / max_size * bar_width))
+            bar = ("#" * filled).ljust(bar_width)
+            label = f"{row['Table']}[{row['Column']}]"
+            print(
+                f"{label[:38]:<38} {bar} "
+                f"{human_bytes(row['TotalSize']):>10}  "
+                f"({row['PctOfDb']:.2f}% of DB, cum. {row['CumulativePct']:.2f}%)"
+            )
+        return
+
+    t = Table(title=title, title_style=_HEADER_STYLE, box=box.SIMPLE_HEAVY, header_style="bold")
+    t.add_column("Table", style="bold")
+    t.add_column("Column")
+    t.add_column("Size Distribution", no_wrap=True)
+    t.add_column("Total Size", justify="right")
+    t.add_column("% of DB", justify="right")
+    t.add_column("Cumulative %", justify="right")
+
+    for _, row in top.iterrows():
+        filled = int(round(float(row["TotalSize"]) / max_size * bar_width))
+        filled = max(0, min(bar_width, filled))
+        bar_style = _size_style(row["TotalSize"])
+        bar = f"[{bar_style}]{'█' * filled}[/{bar_style}][dim]{'░' * (bar_width - filled)}[/dim]"
+        total_txt, total_style = _sized_cell(row["TotalSize"])
+        pct_style = _pct_style(row["PctOfDb"])
+        cum_style = _pct_style(row["CumulativePct"])
+        t.add_row(
+            str(row["Table"]),
+            str(row["Column"]),
+            bar,
+            f"[{total_style}]{total_txt}[/{total_style}]",
+            f"[{pct_style}]{row['PctOfDb']:.2f}%[/{pct_style}]",
+            f"[{cum_style}]{row['CumulativePct']:.2f}%[/{cum_style}]",
+        )
+
+    _console.print()
+    _console.print(t)
+
+
 def print_table_summary(table_summary: pd.DataFrame, title: str = "TABLE SUMMARY") -> None:
     if not RICH_AVAILABLE:
         disp = table_summary.copy()
@@ -226,7 +366,7 @@ def print_table_summary(table_summary: pd.DataFrame, title: str = "TABLE SUMMARY
         print(disp.to_string(index=False))
         return
 
-    t = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold")
+    t = Table(title=title, title_style=_HEADER_STYLE, box=box.SIMPLE_HEAVY, header_style="bold")
     t.add_column("Table", style="bold")
     t.add_column("Rows", justify="right")
     t.add_column("Columns", justify="right")
@@ -278,7 +418,7 @@ def print_columns_table(
         return
 
     table_title = f"{title} ({len(col_metrics)} columns)" if show_header_line else None
-    t = Table(title=table_title, box=box.SIMPLE_HEAVY, header_style="bold")
+    t = Table(title=table_title, title_style=_HEADER_STYLE, box=box.SIMPLE_HEAVY, header_style="bold")
     if show_table_column:
         t.add_column("Table", style="bold")
     t.add_column("Column")
@@ -343,7 +483,7 @@ def print_grouped_by_table(
         return
 
     _console.print()
-    _console.rule(f"[bold]{title}[/bold]")
+    _console.rule(_header_markup(title))
     for tbl in col_metrics_ordered["Table"].drop_duplicates():
         sub = col_metrics_ordered[col_metrics_ordered["Table"] == tbl]
         total = table_sizes.get(tbl)
