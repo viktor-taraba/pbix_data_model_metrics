@@ -43,7 +43,7 @@ This project uses **uv**, not raw `pip`. Source of truth is
 | File | Responsibility |
 |---|---|
 | `pbi_discover.py` | Finds running `msmdsrv.exe` processes launched by Power BI Desktop, reads `msmdsrv.port.txt` from the per-file workspace folder under `%LOCALAPPDATA%\Microsoft\Power BI Desktop\AnalysisServicesWorkspaces\` to get the TCP port. Falls back to scanning that folder directly if process introspection fails (e.g. permissions). Also resolves the actual .pbix file's name/path/size (`_pbix_file_info_for_parent()`) via `psutil.Process.open_files()` on the parent PBIDesktop.exe process - the only place that knows the real file, since the msmdsrv workspace folder is an anonymized internal copy. |
-| `pbi_connection.py` | Thin ADOMD.NET wrapper via `pythonnet` (`clr.AddReference`). Locates `Microsoft.AnalysisServices.AdomdClient.dll` (bundled with Power BI Desktop, or the standalone AMO/ADOMD.NET redistributable), opens a connection, auto-detects the catalog/database name via `$SYSTEM.DBSCHEMA_CATALOGS` if not given. Exposes `query_dmv()` and `query_dax()`, both returning `pandas.DataFrame`. |
+| `pbi_connection.py` | Thin ADOMD.NET wrapper via `pythonnet` (`clr.AddReference`). Locates `Microsoft.AnalysisServices.AdomdClient.dll` (bundled with Power BI Desktop, or the standalone AMO/ADOMD.NET redistributable), opens a connection, auto-detects the catalog/database name via `$SYSTEM.DBSCHEMA_CATALOGS` if not given. Exposes `query_dmv()` and `query_dax()`, both returning `pandas.DataFrame`. `query_dmv()` runs every raw `AdomdDataReader.GetValue()` result through `_convert_dmv_value()`, which explicitly converts `.NET DateTime`/`DBNull` CLR objects to Python `datetime`/`None` - see the "Key implementation facts" note below on why this isn't optional. |
 | `vertipaq_metrics.py` | The actual analyzer logic. Pulls `DISCOVER_STORAGE_TABLES`, `DISCOVER_STORAGE_TABLE_COLUMNS`, `DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS` DMVs and joins them in pandas (DMV SQL doesn't support real joins). Runs one `EVALUATE ROW(..., DISTINCTCOUNT(...))` DAX query per table for exact cardinality. Returns tidy per-column and per-table DataFrames, plus `order_by_table_size_then_field_size()` for the table-grouped ordering used in console section 4 / export sheet `ByTableThenField`, and `get_model_summary()` for the whole-model stats (total size, last data refresh via a 3-source DMV fallback chain, table/column counts) used in console section 0. |
 | `pbi_report.py` | Colorized console rendering via `rich` (`print_table_summary`, `print_columns_table`, `print_grouped_by_table`). Every function degrades to plain `to_string()` output if `rich` isn't installed (checked via `pbi_report.RICH_AVAILABLE`) - keep that fallback working when touching this file, since `rich` is a real but non-critical dependency. |
 | `analyze_pbix.py` | CLI entry point. Auto-discovers/prompts for a running instance, prints the four console sections via `pbi_report`, optional `--export metrics.xlsx`/`.csv`, `--no-color` to force plain text. |
@@ -149,8 +149,8 @@ This project uses **uv**, not raw `pip`. Source of truth is
   lower bound, not an exact process memory figure - see
   `get_model_summary()`'s docstring.
 - **"Last data refresh"** is looked up via `_get_last_data_refresh()` /
-  the shared `_timestamps_from_dmv()` helper, trying three documented
-  rowsets in order, most-authoritative first:
+  the shared `_timestamps_from_dmv()` helper, checking three documented
+  rowsets - **all three, not stopping at the first success**:
   1. `$SYSTEM.TMSCHEMA_PARTITIONS`'s `RefreshedTime` (max across all
      partitions) - the literal, documented meaning of "refresh" in the
      Tabular Object Model (`Partition.RefreshedTime`).
@@ -159,23 +159,75 @@ This project uses **uv**, not raw `pip`. Source of truth is
      Desktop model) this is frequently present-but-null for every row,
      so falling through past it is expected and normal.
   3. `$SYSTEM.TMSCHEMA_TABLES`'s `ModifiedTime` (max across all tables)
-     as a last resort - deliberately not its sibling
-     `StructureModifiedTime`, which tracks schema/structure edits
-     rather than data refreshes and would overstate freshness.
+     - deliberately not its sibling `StructureModifiedTime`, which
+     tracks schema/structure edits rather than data refreshes.
 
-  **This went through one real, user-reported failure already** (the
-  first version of this lookup only tried #2 then #3, both untested
-  against a real engine, and it came back "unknown" against a real
-  report even though DAX Studio showed a value). Don't repeat that
-  mistake: `_timestamps_from_dmv()` takes a `diagnostics: list[str]`
-  and appends a *specific* reason every time a source doesn't pan out
-  (query raised, empty result, column missing, column all-null) -
-  `get_model_summary()`'s `refresh_diagnostics` parameter surfaces this
-  all the way up to `analyze_pbix.py`, which prints it to stderr
-  whenever `LastDataRefresh` is `None`. If you add a fourth fallback
-  source, or if this fails again on some other real report, that
-  diagnostics list is the actual evidence to look at - don't guess at
-  a fifth DMV/column name without it.
+  Whichever of the three return a value, **the maximum across all of
+  them wins** - this function does not stop at the first non-null
+  source.
+
+  A fourth source, `$SYSTEM.DBSCHEMA_CATALOGS`'s `DATE_MODIFIED` (the
+  whole database's own last-modified timestamp), was added and then
+  **removed** - don't re-add it without new, verified evidence. It was
+  added to fix failure #3 below, but the user later reported it was
+  producing an irrelevant/misleading value on a real report: it tracks
+  the database being touched *at all* (which can include things
+  unrelated to a real data refresh - e.g. simply having the file open
+  or another tool querying its metadata), not specifically "the data
+  was reprocessed." Ironic given it was added specifically to fix a
+  staleness problem, but a source that's *too fresh* (bumped by
+  unrelated activity) is just as wrong as one that's stale - it broke
+  the whole point of the feature.
+
+  **This went through three real, user-reported failures already:**
+  1. The first version only tried #2 then #3, both untested against a
+     real engine, and came back "unknown" against a real report even
+     though DAX Studio showed a value - fixed by adding #1
+     (`TMSCHEMA_PARTITIONS`) as a source and adding the diagnostics
+     described below.
+  2. With diagnostics in place, a marshalling bug surfaced: all sources
+     reported "present but every value was null/unparseable"
+     **simultaneously**, across multiple unrelated DMVs. That pattern -
+     every source that could possibly contain a date failing at once -
+     was the tell that it wasn't the data, it was `.NET DateTime`
+     values from `AdomdDataReader.GetValue()` not always being
+     marshalled into Python `datetime` by pythonnet, so
+     `pd.to_datetime(..., errors="coerce")` silently produced `NaT` for
+     every row. Fixed in `pbi_connection.py`: `query_dmv()` now runs
+     every cell through `_convert_dmv_value()`, which explicitly
+     converts `System.DateTime` (via its own `.Year`/`.Month`/etc.
+     properties, not `str()`, since CLR `DateTime.ToString()` is
+     culture-dependent) and `System.DBNull` (→ `None`) before pandas
+     ever sees them - this fixes date handling for *any* DMV column
+     project-wide, not just refresh detection.
+  3. Once dates parsed correctly, a *third* failure mode appeared: the
+     function originally stopped at the first source that returned a
+     non-null value (#1, most "authoritative"-sounding), but for one
+     real report `TMSCHEMA_PARTITIONS.RefreshedTime` returned a stale,
+     years-old date (some partition - e.g. a dimension table - hadn't
+     been reprocessed in a long time). Fixed (independently of the
+     since-removed 4th source) by collecting every source that returns
+     a value into a `candidates` list and taking `max()` across all of
+     them, rather than returning on the first hit - this part of the
+     fix stands regardless of which sources are in the list.
+
+  Don't repeat any of these mistakes: `_timestamps_from_dmv()` takes a
+  `diagnostics: list[str]` and appends a *specific* reason every time a
+  source doesn't pan out (query raised, empty result, column missing,
+  column all-null with a sample raw value and its Python type).
+  `_get_last_data_refresh()` additionally appends a `"{label}: found
+  {ts}"` line for every candidate whenever more than one source
+  succeeds, plus a final `"Used {label} ({ts}) - the most recent of N
+  source(s)"` line - that `"Used "` prefix is what `analyze_pbix.py`
+  checks to decide whether to print the `[i] sources disagreed` info
+  block (it deliberately does NOT print on a routine single-source
+  success with the other two failing for the expected "column is
+  null" reason - only when there was an actual multi-candidate
+  disagreement worth seeing). `get_model_summary()`'s
+  `refresh_diagnostics` parameter surfaces all of this up to
+  `analyze_pbix.py`. If this fails again on some other real report,
+  read the diagnostics - candidate values, sample raw types, which
+  source won - before guessing at a fourth DMV or another fix.
   **Timezone note:** the value returned is naive (no UTC offset) -
   ADOMD.NET/pythonnet hands back the underlying .NET `DateTime` as-is,
   which doesn't carry timezone info the way DAX Studio's UI-level
@@ -183,6 +235,43 @@ This project uses **uv**, not raw `pip`. Source of truth is
   without checking against the specific engine/session - if exact
   offset handling matters for a future change, that needs its own
   investigation rather than a guessed `tz_localize()`.
+- **The `base` column list excludes the engine's auto-generated
+  `RowNumber` column** (via `~storage_columns["ISROWNUMBER"]
+  .fillna(False)`). **This went back and forth once - here's the
+  actual resolution, don't re-litigate it without new evidence:**
+  A column-count mismatch against DAX Studio (a table DAX Studio
+  reported as 17 columns showed as 16 here) was initially attributed to
+  this exclusion, and a version briefly included `RowNumber` to match.
+  That theory was then disproven by a precise, byte-level side-by-side
+  check against DAX Studio's raw Columns-tab numbers (converting DAX
+  Studio's raw byte integers to the same units as this tool's output,
+  not comparing a raw integer against an already-rounded MB string):
+  Data Size and Dictionary Size matched byte-for-byte on every column
+  checked, with `RowNumber` excluded on this side the whole time - so
+  whatever caused that particular 17-vs-16 count mismatch on that one
+  model, it was not `RowNumber`. Given that, and that the user
+  explicitly doesn't want `RowNumber`'s (small) size contribution in
+  the report, the exclusion is back and should stay. It's still a
+  real, physical column of the real table (shares the real table's own
+  `TABLE_ID`, unlike the `H$` pseudo-table ghost rows - a genuinely
+  different problem, see the `real_table_ids` filter note above; don't
+  conflate the two), it's just deliberately not shown here.
+- **One small, real, unresolved discrepancy vs. DAX Studio**: Hierarchy
+  Size for a handful of very-low-cardinality columns differs by tens of
+  bytes (e.g. 32 vs 64 bytes, or +32 bytes flat) - found via the same
+  byte-level check above. Data Size and Dictionary Size were exact
+  matches on every column; only Hierarchy Size showed this, and only
+  for columns with a handful of distinct values. Not chased further:
+  the absolute magnitude is immaterial (tens of bytes in a
+  megabyte-scale table) and guessing at a root cause without live
+  engine access risks repeating the same mistake as the DateTime
+  marshalling and last-refresh issues above (shipping an unverified
+  "fix" for something not actually confirmed). If you get access to a
+  real engine and want to chase this: check whether the table has
+  multiple partitions, and whether `_get_hierarchy_sizes_by_name()`'s
+  groupby is summing one `H$` segment per partition for what should be
+  a single logical hierarchy value - that's the leading hypothesis, not
+  a confirmed cause.
 - **PBIX name/size** in the section-0 summary come from
   `pbi_discover._pbix_file_info_for_parent()`, via
   `psutil.Process.open_files()` on the parent PBIDesktop.exe process -
@@ -192,6 +281,16 @@ This project uses **uv**, not raw `pip`. Source of truth is
   is found (or the fields come back `None` - unsaved report, or
   Windows denies the handle-enumeration call), `pbi_report` shows
   "unknown" rather than failing.
+- **`human_bytes()` in `pbi_report.py` uses 3 decimal places for
+  MB/GB/TB, 1 decimal for B/KB** - not uniformly 1 decimal everywhere.
+  This is deliberate: 1 decimal at MB scale hides a ±50 KB range (e.g.
+  "4.2 MB" could be 4.15-4.25 MB), which is exactly what made an
+  earlier side-by-side comparison against DAX Studio look like a real
+  discrepancy when the underlying byte values actually matched. Don't
+  revert this to save horizontal space - the extra precision is what
+  makes this tool's numbers independently verifiable against DAX
+  Studio (or anything else) instead of requiring the reader to trust
+  a rounded figure.
 - **Colors** are handled entirely in `pbi_report.py` via `rich`; there's
   a plain-text fallback path (`RICH_AVAILABLE = False`) exercised both
   when `rich` isn't installed and when the user passes `--no-color`

@@ -168,28 +168,67 @@ that port still matches a running, discoverable instance. It shows as
 denies the handle-enumeration call this relies on.
 
 Note on "last data refresh": this is looked up via three documented
-rowsets, tried in order, most-authoritative first:
-1. `$SYSTEM.TMSCHEMA_PARTITIONS`'s `RefreshedTime` (max across all
-   partitions) - the literal, documented meaning of "refresh" in the
-   Tabular Object Model.
-2. `$SYSTEM.MDSCHEMA_CUBES`'s `LAST_DATA_UPDATE` - traditional
-   multidimensional-cube metadata; frequently *present but null* on
-   Tabular models (what Power BI Desktop actually runs), so falling
-   through past this is expected and normal, not a sign anything is
-   broken.
-3. `$SYSTEM.TMSCHEMA_TABLES`'s `ModifiedTime` (max across all tables)
-   as a last resort.
+rowsets - `$SYSTEM.TMSCHEMA_PARTITIONS`'s `RefreshedTime`,
+`$SYSTEM.MDSCHEMA_CUBES`'s `LAST_DATA_UPDATE`, and
+`$SYSTEM.TMSCHEMA_TABLES`'s `ModifiedTime` - and **all three are
+checked, not just the first one that answers**; whichever source(s)
+return a value, the most recent one wins. This matters: a real case
+had a partition's `RefreshedTime` succeed with a *stale*, years-old
+answer (a dimension table that hadn't been reprocessed in a while), so
+stopping at the first non-null source (an earlier version of this
+lookup did) would have silently picked the stale one instead of
+checking whether a later value existed elsewhere.
+
+(A fourth candidate, `$SYSTEM.DBSCHEMA_CATALOGS`'s `DATE_MODIFIED` -
+the whole database's own last-modified timestamp - was tried and
+removed: it tracks the database being touched *at all*, which isn't
+necessarily a real data refresh - e.g. it can be bumped just by having
+the file open or querying its metadata - so it produced misleading
+results and isn't used here.)
 
 If it still shows "unknown", none of the three had anything usable -
-and unlike earlier versions of this tool, that's no longer silent:
-run without `--no-color` piped through, and a
-`[!] Could not determine last data refresh` block on stderr lists the
-*specific* reason each of the three sources didn't work (query error,
-empty result, missing column, or an all-null column) - that's the
-place to look, not something to just accept as "unknown" again.
+and that's no longer silent either: run without `--no-color` piped
+through, and a `[!] Could not determine last data refresh` block on
+stderr lists the *specific* reason each source didn't work (query
+error, empty result, missing column, or an all-null column, complete
+with a sample raw value and its type when that happens). If multiple
+sources *did* return a value but they disagreed, you'll instead see a
+`[i] Last data refresh: sources disagreed, used the most recent`
+block listing every candidate found and which one was used - this
+only appears when there's an actual disagreement worth knowing about,
+not on a routine run where only one source succeeds.
+
+One real cause already found and fixed this way: all sources came back
+"present but every value was null/unparseable" *simultaneously* across
+multiple unrelated DMVs at once - a strong signal it wasn't the data
+genuinely being empty everywhere, but a systemic bug. It turned out
+`.NET DateTime` values from `AdomdDataReader.GetValue()` weren't
+always being marshalled into Python `datetime` objects by pythonnet,
+so `pandas.to_datetime()` silently turned every one of them into `NaT`
+with no error. `pbi_connection.py`'s `query_dmv()` now explicitly
+converts `DateTime`/`DBNull` CLR values before they reach pandas
+(`_convert_dmv_value()`).
 
 ## Notes / limitations
 
+- **The internal `RowNumber` column is excluded from every count and
+  size total**, matching what a user actually wants to see (a table's
+  real, user-facing columns) rather than the engine's own internal
+  bookkeeping column. This is a deliberate choice, not an oversight -
+  don't "fix" a reported column-count mismatch against another tool by
+  re-including it; that specific theory was tried and disproven (see
+  `CLAUDE.md`).
+- **Sizes match DAX Studio almost exactly.** Side-by-side verification
+  against DAX Studio's VertiPaq Analyzer (Human Resources sample model)
+  showed Data Size and Dictionary Size matching byte-for-byte on every
+  column checked. Displayed MB/GB/TB values use 3 decimal places (not
+  1) specifically so this kind of comparison is actually possible -
+  "4.2 MB" hides a ±50 KB range, "4.169 MB" doesn't. The one small,
+  real gap found was in Hierarchy Size for a handful of very-low-
+  cardinality columns (tens of bytes out of megabyte-scale tables,
+  e.g. 32 vs 64 bytes) - immaterial for identifying what's actually
+  consuming space in a model, and not chased further without a
+  verified root cause to fix rather than guess at.
 - **Hierarchy Size** is derived from the engine's internal per-column
   "H$" pseudo-table structures. Getting this right required routing the
   join through the "H$" pseudo-table's *own* column metadata rather than
