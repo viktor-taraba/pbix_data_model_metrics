@@ -16,6 +16,8 @@ it's just monochrome.
 
 from __future__ import annotations
 
+import sys
+
 import pandas as pd
 
 try:
@@ -30,7 +32,50 @@ except ImportError:  # pragma: no cover - exercised via the fallback path
 
 _SIZE_COLUMNS = ["DataSize", "DictionarySize", "HierarchySize", "TotalSize"]
 
+# Style used for every top-level report SECTION HEADER (table titles, the
+# model-summary panel's title, and the "grouped by table" rule) - a solid
+# colored background so headers are unmistakably distinct from the data
+# rows/colors below them (red/yellow/green/dim are already "taken" for
+# size/percentage/cardinality scales, so headers deliberately use blue,
+# a color not otherwise used for data coloring anywhere in this module).
+_HEADER_STYLE = "bold white on grey23"
+
+# Style used for short one-line STATUS/PROGRESS messages printed by the
+# CLI (e.g. "Connecting to ...", "Extracting storage metrics ...", or a
+# "[!]"/"[i]" diagnostic note) via print_status() below - yellow, so the
+# tool's own running commentary is visually distinct from both the
+# colored section headers above and the report's data tables.
+_STATUS_STYLE = "yellow"
+
 _console: "Console | None" = Console() if RICH_AVAILABLE else None
+_err_console: "Console | None" = Console(stderr=True) if RICH_AVAILABLE else None
+
+
+def _header_markup(text: str) -> str:
+    """Wrap a section title in the shared header style as rich markup.
+
+    Table() has its own `title_style` constructor parameter, but Panel()
+    and Console.rule() don't - for those, the style has to be embedded
+    directly in the title text itself as markup, which is what this
+    produces."""
+    return f"[{_HEADER_STYLE}] {text} [/]"
+
+
+def print_status(message: str, to_stderr: bool = False) -> None:
+    """Print a short status/progress line - e.g. "Connecting to
+    localhost:...", "Extracting storage metrics ...", or a "[!]"/"[i]"
+    diagnostic note - styled yellow so it visually reads as "the tool
+    talking to you" rather than part of the report's own data tables.
+
+    Falls back to a plain, uncolored print() when `rich` isn't installed
+    or `--no-color` forced RICH_AVAILABLE off - there's no color
+    available in that mode, so this just prints the message unstyled.
+    """
+    if not RICH_AVAILABLE:
+        print(message, file=sys.stderr if to_stderr else None)
+        return
+    console = _err_console if to_stderr else _console
+    console.print(message, style=_STATUS_STYLE, highlight=False)
 
 
 def human_bytes(n) -> str:
@@ -163,7 +208,7 @@ def print_model_summary(summary: dict, title: str = "MODEL SUMMARY") -> None:
         f"[bold]Last data refresh:[/bold] {refresh_txt}\n"
         f"[bold]Tables:[/bold] {num_tables}    [bold]Columns:[/bold] {num_columns}"
     )
-    panel = Panel(body, title=title, border_style="bold", box=box.ROUNDED, expand=False)
+    panel = Panel(body, title=_header_markup(title), border_style="bold", box=box.ROUNDED, expand=False)
     _console.print()
     _console.print(panel)
 
@@ -195,7 +240,7 @@ def print_table_size_distribution(
             )
         return
 
-    t = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold")
+    t = Table(title=title, title_style=_HEADER_STYLE, box=box.SIMPLE_HEAVY, header_style="bold")
     t.add_column("Table", style="bold")
     t.add_column("Size Distribution", no_wrap=True)
     t.add_column("Total Size", justify="right")
@@ -283,7 +328,7 @@ def print_column_size_distribution(
             )
         return
 
-    t = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold")
+    t = Table(title=title, title_style=_HEADER_STYLE, box=box.SIMPLE_HEAVY, header_style="bold")
     t.add_column("Table", style="bold")
     t.add_column("Column")
     t.add_column("Size Distribution", no_wrap=True)
@@ -321,7 +366,7 @@ def print_table_summary(table_summary: pd.DataFrame, title: str = "TABLE SUMMARY
         print(disp.to_string(index=False))
         return
 
-    t = Table(title=title, box=box.SIMPLE_HEAVY, header_style="bold")
+    t = Table(title=title, title_style=_HEADER_STYLE, box=box.SIMPLE_HEAVY, header_style="bold")
     t.add_column("Table", style="bold")
     t.add_column("Rows", justify="right")
     t.add_column("Columns", justify="right")
@@ -373,7 +418,7 @@ def print_columns_table(
         return
 
     table_title = f"{title} ({len(col_metrics)} columns)" if show_header_line else None
-    t = Table(title=table_title, box=box.SIMPLE_HEAVY, header_style="bold")
+    t = Table(title=table_title, title_style=_HEADER_STYLE, box=box.SIMPLE_HEAVY, header_style="bold")
     if show_table_column:
         t.add_column("Table", style="bold")
     t.add_column("Column")
@@ -438,7 +483,7 @@ def print_grouped_by_table(
         return
 
     _console.print()
-    _console.rule(f"[bold]{title}[/bold]")
+    _console.rule(_header_markup(title))
     for tbl in col_metrics_ordered["Table"].drop_duplicates():
         sub = col_metrics_ordered[col_metrics_ordered["Table"] == tbl]
         total = table_sizes.get(tbl)
