@@ -34,14 +34,28 @@ _console: "Console | None" = Console() if RICH_AVAILABLE else None
 
 
 def human_bytes(n) -> str:
+    """Format a byte count for display. B/KB stay at 1 decimal place
+    (sub-KB precision beyond that isn't meaningful); MB/GB/TB use 3
+    decimal places, since 1 decimal at that scale hides real differences
+    of tens of KB (e.g. "4.2 MB" could be anywhere from ~4.15-4.25 MB) -
+    3 decimals make those actually visible when comparing against another
+    tool's numbers instead of masking them behind rounding."""
     if pd.isna(n):
         return "-"
     n = float(n)
-    for unit in ["B", "KB", "MB", "GB"]:
-        if n < 1024:
-            return f"{n:,.1f} {unit}"
-        n /= 1024
-    return f"{n:,.1f} TB"
+    if n < 1024:
+        return f"{n:,.1f} B"
+    n /= 1024
+    if n < 1024:
+        return f"{n:,.1f} KB"
+    n /= 1024
+    if n < 1024:
+        return f"{n:,.3f} MB"
+    n /= 1024
+    if n < 1024:
+        return f"{n:,.3f} GB"
+    n /= 1024
+    return f"{n:,.3f} TB"
 
 
 def _size_style(n_bytes) -> str:

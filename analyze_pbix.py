@@ -123,18 +123,33 @@ def main():
             file=sys.stderr,
         )
 
-    if model_summary["LastDataRefresh"] is None and refresh_diagnostics:
-        print(
-            "\n[!] Could not determine last data refresh. Reasons per source tried:",
-            file=sys.stderr,
-        )
-        for msg in refresh_diagnostics:
-            print(f"    - {msg}", file=sys.stderr)
-        print(
-            "    (Shows as 'unknown' in MODEL SUMMARY below instead of silently "
-            "picking a wrong date.)\n",
-            file=sys.stderr,
-        )
+    if refresh_diagnostics:
+        if model_summary["LastDataRefresh"] is None:
+            print(
+                "\n[!] Could not determine last data refresh. Reasons per source tried:",
+                file=sys.stderr,
+            )
+            for msg in refresh_diagnostics:
+                print(f"    - {msg}", file=sys.stderr)
+            print(
+                "    (Shows as 'unknown' in MODEL SUMMARY below instead of silently "
+                "picking a wrong date.)\n",
+                file=sys.stderr,
+            )
+        elif any(msg.startswith("Used ") for msg in refresh_diagnostics):
+            # This marker only appears when more than one source actually
+            # returned a value (see _get_last_data_refresh) - a routine run
+            # where only one source succeeds and the rest fail with an
+            # expected "column is null" reason doesn't trigger this, so
+            # this block only fires for a genuine, worth-knowing-about
+            # disagreement between sources.
+            print(
+                "\n[i] Last data refresh: sources disagreed, used the most recent:",
+                file=sys.stderr,
+            )
+            for msg in refresh_diagnostics:
+                print(f"    - {msg}", file=sys.stderr)
+            print(file=sys.stderr)
 
     # ---- console output (five sections) ----
 

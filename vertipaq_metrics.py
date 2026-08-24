@@ -319,6 +319,15 @@ def get_column_metrics(
     # "ghost" row (DATATYPE/COLUMN_ENCODING blank -> "N/A"/"UNKNOWN",
     # DICTIONARY_SIZE 0) sitting right alongside the real one. This was a
     # real, observed bug: don't reintroduce it by removing this filter.
+    #
+    # ISROWNUMBER columns (the engine's auto-generated internal row-index
+    # column) are also excluded - they're not a real, user-meaningful
+    # column and the user doesn't want their (small) size contribution
+    # cluttering the report. (An earlier version of this code included
+    # them to chase a since-disproven theory about a table/column-count
+    # mismatch against DAX Studio - that mismatch turned out unrelated to
+    # RowNumber; see the module's other notes on the real, tiny
+    # Hierarchy-size discrepancy for low-cardinality columns instead.)
     base = storage_columns[
         (~storage_columns["ISROWNUMBER"].fillna(False))
         & (storage_columns["TABLE_ID"].astype(str).isin(real_table_ids))
@@ -412,8 +421,25 @@ def _timestamps_from_dmv(
         return None
     timestamps = pd.to_datetime(df[column], errors="coerce").dropna()
     if timestamps.empty:
+        # Show the actual raw value(s) and their Python type, not just
+        # "null/unparseable" - that phrase alone doesn't distinguish
+        # "this really is SQL NULL" from "this is some non-null value
+        # pd.to_datetime doesn't know how to parse" (e.g. an un-marshalled
+        # CLR object slipping through pbi_connection's conversion). Both
+        # produce an all-NaT result under errors="coerce" with no
+        # exception, so without the raw value this diagnostic is just as
+        # unhelpful as no diagnostic at all - which is exactly the trap
+        # this fell into once already.
+        raw_values = df[column].tolist()
+        non_none = [v for v in raw_values if v is not None]
+        if non_none:
+            sample = non_none[0]
+            sample_desc = f"sample raw value: {sample!r} (type: {type(sample).__name__})"
+        else:
+            sample_desc = "all raw values were Python None (genuinely NULL, not a parsing issue)"
         diagnostics.append(
-            f"{source_label}: column '{column}' present but every value was null/unparseable"
+            f"{source_label}: column '{column}' present but every value was "
+            f"null/unparseable ({sample_desc})"
         )
         return None
     return timestamps.max()
@@ -422,33 +448,52 @@ def _timestamps_from_dmv(
 def _get_last_data_refresh(conn: PbiConnection, diagnostics: list[str] | None = None):
     """Best-effort lookup of the model's last data-refresh timestamp.
 
-    Tries three documented rowsets, in order, most-authoritative first:
+    Tries three documented rowsets, tracking every one that returns a
+    usable value rather than stopping at the first success:
 
     1. $SYSTEM.TMSCHEMA_PARTITIONS's RefreshedTime - each partition's own
        "when was this data last processed" timestamp; this is the literal,
        documented meaning of "refresh" in the Tabular Object Model
-       (`Partition.RefreshedTime`), so it's tried first. Max across all
-       partitions = the model's overall last data refresh.
+       (`Partition.RefreshedTime`). Max across all partitions.
     2. $SYSTEM.MDSCHEMA_CUBES's LAST_DATA_UPDATE - traditional
        multidimensional-cube metadata. On Tabular models (what Power BI
        Desktop actually runs) this column is frequently present but
        *null* for every row - the query still succeeds, there's just
-       nothing usable in it, so falling through past this is expected and
-       normal, not a sign anything is broken.
+       nothing usable in it, which is expected and normal, not a sign
+       anything is broken.
     3. $SYSTEM.TMSCHEMA_TABLES's ModifiedTime - a broader "last modified"
        at the table level that covers data AND structure changes (unlike
-       its sibling StructureModifiedTime, which is structure-only and
-       deliberately not used here). Kept only as a last resort since it
-       can overstate freshness after a schema-only edit with no real data
-       refresh.
+       its sibling StructureModifiedTime, which is structure-only).
+
+    A fourth candidate, $SYSTEM.DBSCHEMA_CATALOGS's DATE_MODIFIED (the
+    whole database's own last-modified timestamp), was tried and removed:
+    it tracks the database being *touched* at all - which can include
+    things unrelated to a real data refresh, like simply having the file
+    open or querying its metadata - so it isn't a reliable signal of when
+    the *data* was actually last refreshed, and including it produced
+    misleading results on a real report. Don't re-add it without a
+    verified case showing it's actually needed and actually correct.
+
+    **Why every remaining source is checked instead of stopping at the
+    first hit:** a real, observed case had TMSCHEMA_PARTITIONS.RefreshedTime
+    succeed with a *stale* answer - one partition (e.g. a dimension table)
+    hadn't been reprocessed in a while, so its RefreshedTime was older than
+    the model's actual last refresh. Taking the max across every source
+    that succeeded (rather than the first non-null one) avoids ever
+    under-reporting freshness just because a more "authoritative-sounding"
+    source happened to answer first with an out-of-date value.
 
     Returns a pandas.Timestamp, or None if none of the three yielded one.
-    Every rowset that didn't pan out gets a specific reason appended to
-    `diagnostics` (if given) - always check that when this returns None,
-    instead of assuming the model just "has no refresh info".
+    `diagnostics` (if given) always gets one entry per source that didn't
+    pan out, AND - whenever more than one source succeeded - one entry per
+    successful source plus a note on which was used, so a disagreement
+    between sources is visible in the report instead of silently picking a
+    number with no explanation of where it came from.
     """
     if diagnostics is None:
         diagnostics = []
+
+    candidates: list[tuple[str, "pd.Timestamp"]] = []
 
     for dmv_sql, column, label in (
         ("SELECT * FROM $SYSTEM.TMSCHEMA_PARTITIONS", "RefreshedTime", "TMSCHEMA_PARTITIONS.RefreshedTime"),
@@ -457,9 +502,22 @@ def _get_last_data_refresh(conn: PbiConnection, diagnostics: list[str] | None = 
     ):
         ts = _timestamps_from_dmv(conn, dmv_sql, column, label, diagnostics)
         if ts is not None:
-            return ts
+            candidates.append((label, ts))
 
-    return None
+    if not candidates:
+        return None
+
+    if len(candidates) > 1:
+        for label, ts in candidates:
+            diagnostics.append(f"{label}: found {ts}")
+
+    winner_label, winner_ts = max(candidates, key=lambda pair: pair[1])
+    if len(candidates) > 1:
+        diagnostics.append(
+            f"Used {winner_label} ({winner_ts}) - the most recent of "
+            f"{len(candidates)} source(s) that returned a value."
+        )
+    return winner_ts
 
 
 def get_model_summary(
