@@ -140,7 +140,7 @@ def main():
             # This marker only appears when more than one source actually
             # returned a value (see _get_last_data_refresh) - a routine run
             # where only one source succeeds and the rest fail with an
-            # expected "column is null" reason doesn't trigger this, so
+            # expected "column is null" reason does not trigger this, so
             # this block only fires for a genuine, worth-knowing-about
             # disagreement between sources.
             print(
@@ -151,12 +151,19 @@ def main():
                 print(f"    - {msg}", file=sys.stderr)
             print(file=sys.stderr)
 
-    # ---- console output (five sections) ----
+    # ---- console output (six sections) ----
 
     # 0. Whole-model summary: total in-memory size, last data refresh,
-    # table/column counts, and a size-by-table distribution visual.
+    # table/column counts, and a size-by-table distribution visual,
+    # followed immediately by the column-level equivalent: the top 10
+    # columns by Total Size with a cumulative % of the model's total
+    # size, so you can see at a glance how concentrated the model's bulk
+    # is in just a handful of columns.
     pbi_report.print_model_summary(model_summary)
     pbi_report.print_table_size_distribution(table_summary)
+    pbi_report.print_column_size_distribution(
+        col_metrics, total_model_size=model_summary["TotalSize"]
+    )
 
     # 1. Per-table rollup.
     pbi_report.print_table_summary(table_summary, title="TABLE SUMMARY")
