@@ -186,11 +186,13 @@ def _get_cardinalities(
         # per-column retry. A *mismatch* is just as much a failure as an
         # exception and must not be ignored the way it previously was.
         missing = [c for c in col_names if (table_name, c) not in cardinalities]
+        still_failed: list[str] = []
         for col_name in missing:
             single_dax = (
                 f'EVALUATE ROW("C", '
                 f"DISTINCTCOUNT('{safe_table}'[{_quote_column(col_name)}]))"
             )
+            distinctcount_error: Exception | None = None
             try:
                 r = conn.query_dax(single_dax)
                 if r is None or r.empty:
@@ -199,19 +201,55 @@ def _get_cardinalities(
                 actual_col = normalized_index.get(_normalize_alias("C"), r.columns[0])
                 val = r.iloc[0][actual_col]
                 cardinalities[(table_name, col_name)] = None if pd.isna(val) else int(val)
+                continue
             except Exception as exc:  # noqa: BLE001
+                distinctcount_error = exc
+
+            # DISTINCTCOUNT/DISTINCT/VALUES/SUMMARIZE all raise "column is
+            # part of a composite key" for certain engine-managed columns -
+            # observed on Field Parameter tables' own [Parameter] column
+            # (verified live: "KPI_#1[Parameter]", "M-W-D[M-W-D]" - the
+            # text column Power BI generates from NAMEOF() field switches).
+            # COUNTROWS(ALLNOBLANKROW(column)) sidesteps this restriction -
+            # verified live to raise no error there AND to return the exact
+            # same number DISTINCTCOUNT gives on an ordinary column (both
+            # returned 9167 for GeneratedEcommerceData[Page Views]), so it's
+            # safe as a fallback rather than a guessed workaround. The only
+            # known difference from DISTINCTCOUNT: ALLNOBLANKROW excludes the
+            # engine's auto-injected blank row for unmatched relationships,
+            # so on a column with an actual RI-violation blank row this can
+            # read one lower than true DISTINCTCOUNT would - immaterial here
+            # since DISTINCTCOUNT is simply unavailable for these columns.
+            allnoblankrow_dax = (
+                f'EVALUATE ROW("C", '
+                f"COUNTROWS(ALLNOBLANKROW('{safe_table}'[{_quote_column(col_name)}])))"
+            )
+            try:
+                r = conn.query_dax(allnoblankrow_dax)
+                if r is None or r.empty:
+                    raise RuntimeError("query returned no rows")
+                normalized_index = {_normalize_alias(c): c for c in r.columns}
+                actual_col = normalized_index.get(_normalize_alias("C"), r.columns[0])
+                val = r.iloc[0][actual_col]
+                cardinalities[(table_name, col_name)] = None if pd.isna(val) else int(val)
+            except Exception:  # noqa: BLE001 - report the original DISTINCTCOUNT error below
                 cardinalities[(table_name, col_name)] = None
+                still_failed.append(col_name)
                 warnings_out.append(
                     f"{table_name}[{col_name}]: cardinality query failed - "
-                    f"{type(exc).__name__}: {exc}"
+                    f"{type(distinctcount_error).__name__}: {distinctcount_error}"
                 )
 
-        if batch_error is not None and missing:
+        if batch_error is not None and still_failed:
             # Surface the batch-level failure too (once per table), even
             # though the per-column retries above already logged their own
             # errors - the batch error is often the more informative one
             # (e.g. it'll show a DAX syntax/name-resolution error that a
             # single-column query for an unrelated column won't reproduce).
+            # Gated on still_failed (post-fallback), not the original
+            # `missing` list - a column resolved by the ALLNOBLANKROW
+            # fallback above is a success, not a failure, and must not make
+            # analyze_pbix.py report it under "could not be determined".
             warnings_out.append(
                 f"{table_name}: batch cardinality query failed - "
                 f"{type(batch_error).__name__}: {batch_error}"

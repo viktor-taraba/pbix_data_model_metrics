@@ -98,10 +98,50 @@ Other options:
 ```bash
 uv run python analyze_pbix.py --port 54321          # skip discovery, connect directly
 uv run python analyze_pbix.py --no-cardinality      # faster, skips the DISTINCTCOUNT pass
-uv run python analyze_pbix.py --export metrics.csv
+uv run python analyze_pbix.py --export metrics.xlsx
 uv run python analyze_pbix.py --export metrics.xlsx --top 50   # show/print more columns in the console top-N section
 uv run python analyze_pbix.py --no-color            # plain text output, no colors
 ```
+
+### One-shot end-to-end run (`run_pbix_analysis.ps1`)
+
+If you don't already have the file open in Power BI Desktop and just
+want a single command that opens it, analyzes it, and cleans up after
+itself, use the PowerShell wrapper script:
+
+```powershell
+.\run_pbix_analysis.ps1 -PbixPath "C:\reports\Sales.pbix"
+```
+
+This:
+
+1. Launches Power BI Desktop with that `.pbix`, minimized.
+2. Polls (reusing `pbi_discover.py`'s own detection logic) until the
+   model has actually finished loading, rather than guessing with a
+   fixed sleep.
+3. Runs `uv run python analyze_pbix.py --port <port>` against it.
+4. Closes that Power BI Desktop instance once the analysis is done.
+
+Pass extra `analyze_pbix.py` flags through `-AnalyzeArgs`, e.g.:
+
+```powershell
+.\run_pbix_analysis.ps1 -PbixPath "C:\reports\Sales.pbix" -AnalyzeArgs '--export','metrics.xlsx','--no-cardinality'
+```
+
+Useful when scripting a batch of reports or running this from a
+scheduled task, since you don't have to leave Power BI Desktop open
+and pick an instance interactively. Notes/limits:
+
+- Power BI Desktop has no real headless mode, so "silent" here means
+  minimized, not invisible — a window still briefly exists.
+- Default timeout waiting for the model to load is 180s (`-TimeoutSeconds`
+  to change it) - large models can take longer.
+- Assumes Power BI Desktop is installed at its normal Program Files
+  location, or resolvable via `Get-Command PBIDesktop.exe` (Store
+  install). Edit the script directly if yours lives somewhere unusual.
+- It closes the specific Power BI Desktop instance it launched (by
+  PID), not every open instance - other reports you already had open
+  are left alone.
 
 ### Console output
 
