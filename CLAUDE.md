@@ -47,6 +47,7 @@ This project uses **uv**, not raw `pip`. Source of truth is
 | `vertipaq_metrics.py` | The actual analyzer logic. Pulls `DISCOVER_STORAGE_TABLES`, `DISCOVER_STORAGE_TABLE_COLUMNS`, `DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS` DMVs and joins them in pandas (DMV SQL doesn't support real joins). Runs one `EVALUATE ROW(..., DISTINCTCOUNT(...))` DAX query per table for exact cardinality. Returns tidy per-column and per-table DataFrames, plus `order_by_table_size_then_field_size()` for the table-grouped ordering used in console section 4 / export sheet `ByTableThenField`, and `get_model_summary()` for the whole-model stats (total size, last data refresh via a 3-source DMV fallback chain, table/column counts) used in console section 0. |
 | `pbi_report.py` | Colorized console rendering via `rich` (`print_table_summary`, `print_columns_table`, `print_grouped_by_table`). Every function degrades to plain `to_string()` output if `rich` isn't installed (checked via `pbi_report.RICH_AVAILABLE`) - keep that fallback working when touching this file, since `rich` is a real but non-critical dependency. |
 | `analyze_pbix.py` | CLI entry point. Auto-discovers/prompts for a running instance, prints the four console sections via `pbi_report`, optional `--export metrics.xlsx`/`.csv`, `--no-color` to force plain text. |
+| `run_pbix_analysis.ps1` | PowerShell wrapper for the whole end-to-end flow when nothing is already open: launches Power BI Desktop with a given `.pbix` (minimized), polls via `pbi_discover.py`'s own detection logic (not a fixed sleep) until the model has actually finished loading, runs `uv run python analyze_pbix.py --port <port>`, then closes that specific Power BI Desktop instance. See "PowerShell wrapper" below. |
 | `README.md` | End-user setup + usage instructions. |
 
 ## Key implementation facts (don't re-derive these from scratch)
@@ -301,6 +302,54 @@ This project uses **uv**, not raw `pip`. Source of truth is
   - if you add a new colored metric, follow that pattern rather than
   inlining `rich` markup into the row-building loops.
 
+## PowerShell wrapper (`run_pbix_analysis.ps1`)
+
+A convenience script for the common "I don't have Power BI Desktop
+open yet, just run the whole thing" case, used as:
+
+```powershell
+.\run_pbix_analysis.ps1 -PbixPath "C:\reports\Sales.pbix" -AnalyzeArgs '--export','metrics.xlsx'
+```
+
+It launches Power BI Desktop with the given `.pbix` (`-WindowStyle
+Minimized` - Power BI Desktop has no true headless mode, so this is
+the closest available to "silent"), then **polls `pbi_discover.py`'s
+own `find_all()` logic** (via a small throwaway probe script written
+to `$env:TEMP`, run through `uv run python`) until an `msmdsrv.exe`
+instance shows up whose parent PID matches the process it just
+launched, or - as a fallback - whose detected `pbix_path` matches the
+file it opened. This is deliberately **not** a fixed `Start-Sleep`:
+model load time varies a lot by size, and reusing the existing
+discovery module means there's only one place that knows how to find
+a running instance, rather than a second, subtly-different
+reimplementation living in PowerShell.
+
+Once a port is found, it runs `uv run python analyze_pbix.py --port
+<port> @AnalyzeArgs` from `-ProjectDir` (defaults to the script's own
+folder — it must sit alongside `analyze_pbix.py`), then closes that
+specific Power BI Desktop instance by PID: `CloseMainWindow()` first
+(clean shutdown, no unsaved-changes prompt since nothing was edited),
+force `Stop-Process` after a 10s grace period if it didn't exit.
+
+If you extend/modify this script:
+- Keep it matching by **PID** first (`inst` whose parent process is
+  the one this script launched) and falling back to path-matching only
+  if that fails — don't switch to matching by path alone, since a
+  second already-open copy of the same file (or a similarly-named
+  file) could resolve to the wrong instance.
+- Don't replace the discovery poll with a fixed sleep "for
+  simplicity" — that's exactly the kind of guess this project's other
+  Windows-only components (see the cardinality/last-refresh notes
+  above) have learned not to make without live verification, and here
+  there's a already a real, working detection primitive to reuse
+  instead of guessing a timeout.
+- It only ever closes the one instance it launched (matched by PID),
+  never every open Power BI Desktop window — preserve that if you
+  touch the cleanup step.
+- Like everything else Windows-only in this repo, this can't be
+  exercised end-to-end from this sandbox (no Windows, no Power BI
+  Desktop) — see "Testing" below.
+
 ## If asked to extend this
 
 - **Relationship size / RI violations**: use `TMSCHEMA_RELATIONSHIPS`
@@ -329,7 +378,10 @@ There's no automated test suite here — the only way to fully validate
 changes end-to-end is running `uv run python analyze_pbix.py` against a
 real, open Power BI Desktop file on Windows (this sandbox can't
 exercise the actual ADOMD.NET connection: Linux, no Power BI Desktop,
-no .NET AS engine, and no `uv sync` without PyPI network access).
+no .NET AS engine, and no `uv sync` without PyPI network access). The
+same applies to `run_pbix_analysis.ps1` - it's PowerShell and depends
+on a real Power BI Desktop install, so it can only be smoke-tested by
+inspection here, not actually run.
 
 For logic changes to `vertipaq_metrics.py` specifically (e.g. the
 hierarchy-size join), prefer a synthetic-DMV unit test over guessing:
